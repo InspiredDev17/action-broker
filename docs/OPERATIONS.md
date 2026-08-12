@@ -22,7 +22,7 @@ regardless of representation, production configuration must provide:
 | --- | --- |
 | Identity | distinct unprivileged broker UID and Platform UID; exact Platform UID -> user/agent mapping |
 | Socket | absolute path, broker-owned setgid directory, Platform access group, `0660` socket, frame/request bounds |
-| Approval trust | accepted token/schema versions, Ed25519 public keys, key lifecycle, max lifetime and clock skew |
+| Approval trust | accepted token/schema versions, unique Ed25519 public-key IDs, required activation, optional retirement/revocation cutoffs, max lifetime and clock skew |
 | Replay | dedicated durable ledger path, permissions, synchronization/durability policy, retention |
 | Permissions | user/agent permission source and fail-closed refresh behavior |
 | Risk/approval | deterministic risk mapping and acceptable approval types |
@@ -81,7 +81,8 @@ controls pass:
    prohibited secret/pseudo-filesystem target;
 4. every enabled program resolves to the expected non-writable executable and
    has a complete argument/environment/sandbox policy;
-5. approval verification keys and time policy are valid;
+5. approval verification keys have unique IDs, secure files, coherent lifecycle
+   windows, and valid time policy;
 6. the replay ledger opens transactionally and passes a durable write/read
    check appropriate to the configured profile;
 7. audit chain state is internally consistent and writable;
@@ -162,6 +163,30 @@ Monitor at least:
 Metrics and alerts must use bounded identifiers and reason codes. Do not put raw
 arguments, file contents, command output, HTTP bodies, approval envelopes,
 credentials, or query tokens in metric labels or logs.
+
+## Approval key lifecycle operations
+
+Plan routine rotation with two unique key IDs. Add the new public key with a
+future `active_from_unix_seconds`; configure the old key's
+`retire_at_unix_seconds` as the exclusive issuance cutoff; deploy matching
+signer policy; then perform a validated broker restart. Keep the old public key
+configured until its last pre-retirement token has expired plus allowed clock
+skew and incident margin. Removing it earlier creates an availability failure,
+not a security bypass.
+
+For compromise, stop approval-required execution first, set
+`revoke_at_unix_seconds` to the incident cutoff, deploy root-owned configuration
+and replacement public key material, and restart through the complete readiness
+sequence. At the revocation instant all tokens under that key fail, including
+tokens issued before the cutoff. Preserve audit, replay, and Agent Green state
+for investigation. Do not wait for the ordinary retirement overlap when the
+key is suspected compromised.
+
+The current daemon does not live-reload keys or lifecycle policy. Monitoring
+must therefore alert on configuration generation, restart success, active key
+set, upcoming activation/retirement, and revocation state without exposing key
+bytes or token material. A configuration file edit alone is not proof that a
+revocation is enforced by the running process.
 
 ## Audit chain operations
 

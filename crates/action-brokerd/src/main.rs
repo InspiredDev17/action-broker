@@ -11,7 +11,8 @@ use std::thread;
 use std::time::Duration;
 
 use action_broker_core::approval::{
-    ApprovalVerifier, ApprovalVerifierConfig, SqliteReplayStore, TrustedKeyRegistry,
+    ApprovalVerifier, ApprovalVerifierConfig, SqliteReplayStore, TrustedKeyLifecycle,
+    TrustedKeyRegistry,
 };
 use action_broker_core::audit::HashChainedJsonlAuditSink;
 use action_broker_core::broker::{ActionBroker, AuthenticatedRequester, BrokerLimits};
@@ -101,6 +102,9 @@ struct PlatformPeerConfig {
 struct ApprovalKeyConfig {
     key_id: String,
     public_key_path: PathBuf,
+    active_from_unix_seconds: i64,
+    retire_at_unix_seconds: Option<i64>,
+    revoke_at_unix_seconds: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -211,8 +215,16 @@ fn build_broker(config: &DaemonConfig) -> Result<ActionBroker, BrokerError> {
         let verifying_key = VerifyingKey::from_bytes(&key_bytes)
             .map_err(|_| BrokerError::invalid("approval public key is invalid"))?;
         trusted_keys
-            .insert(key.key_id.clone(), verifying_key)
-            .map_err(|_| BrokerError::invalid("approval key ID is invalid"))?;
+            .insert(
+                key.key_id.clone(),
+                verifying_key,
+                TrustedKeyLifecycle {
+                    active_from_unix_seconds: key.active_from_unix_seconds,
+                    retire_at_unix_seconds: key.retire_at_unix_seconds,
+                    revoke_at_unix_seconds: key.revoke_at_unix_seconds,
+                },
+            )
+            .map_err(|_| BrokerError::invalid("approval key configuration is invalid"))?;
     }
     let replay_store = Arc::new(
         SqliteReplayStore::open(&config.replay_database_path).map_err(|_| {
@@ -634,6 +646,21 @@ mod tests {
     fn strict_decoder_rejects_trailing_protocol_data() {
         let response = br#"{"protocol_version":1,"request_id":"00000000-0000-0000-0000-000000000000","target":{"type":"local"},"capability":"ReadFile","status":"rejected","output":null,"error":{"code":"invalid_request","message":"bad","retryable":false},"started_at_unix_milliseconds":0,"finished_at_unix_milliseconds":0,"output_sha256":null}{}"#;
         assert!(decode_strict::<ActionResponse>(response).is_err());
+    }
+
+    #[test]
+    fn approval_key_lifecycle_is_required_and_strict() -> Result<(), Box<dyn Error>> {
+        let valid = br#"{"key_id":"key-1","public_key_path":"/etc/action-broker/key.pub","active_from_unix_seconds":1700000000,"retire_at_unix_seconds":1700000300,"revoke_at_unix_seconds":null}"#;
+        let decoded = decode_strict::<ApprovalKeyConfig>(valid)?;
+        assert_eq!(decoded.active_from_unix_seconds, 1_700_000_000);
+        assert_eq!(decoded.retire_at_unix_seconds, Some(1_700_000_300));
+
+        let missing_activation =
+            br#"{"key_id":"key-1","public_key_path":"/etc/action-broker/key.pub"}"#;
+        assert!(decode_strict::<ApprovalKeyConfig>(missing_activation).is_err());
+        let unknown = br#"{"key_id":"key-1","public_key_path":"/etc/action-broker/key.pub","active_from_unix_seconds":1700000000,"bypass":true}"#;
+        assert!(decode_strict::<ApprovalKeyConfig>(unknown).is_err());
+        Ok(())
     }
 
     #[test]

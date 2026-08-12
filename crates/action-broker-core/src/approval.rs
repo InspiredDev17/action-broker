@@ -95,6 +95,16 @@ pub enum ApprovalError {
     MalformedToken(&'static str),
     #[error("approval token references an untrusted key")]
     UntrustedKey,
+    #[error("approval verification key is not active")]
+    KeyNotActive,
+    #[error("approval was issued after the verification key retired")]
+    KeyRetired,
+    #[error("approval verification key is revoked")]
+    KeyRevoked,
+    #[error("approval verification key lifecycle is invalid")]
+    InvalidKeyLifecycle,
+    #[error("approval verification key ID is duplicated")]
+    DuplicateKeyId,
     #[error("approval signature is invalid")]
     InvalidSignature,
     #[error("approval payload is not canonical JCS JSON")]
@@ -258,9 +268,25 @@ impl ReplayStore for InMemoryReplayStore {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrustedKeyLifecycle {
+    /// Inclusive instant at which the key may begin verifying approvals.
+    pub active_from_unix_seconds: i64,
+    /// Exclusive approval issuance cutoff. Tokens issued before this instant
+    /// may finish their normal short lifetime unless the key is revoked.
+    pub retire_at_unix_seconds: Option<i64>,
+    /// Hard cutoff. At or after this instant every token under the key fails.
+    pub revoke_at_unix_seconds: Option<i64>,
+}
+
+struct TrustedKey {
+    key: VerifyingKey,
+    lifecycle: TrustedKeyLifecycle,
+}
+
 #[derive(Default)]
 pub struct TrustedKeyRegistry {
-    keys: BTreeMap<String, VerifyingKey>,
+    keys: BTreeMap<String, TrustedKey>,
 }
 
 impl TrustedKeyRegistry {
@@ -271,22 +297,31 @@ impl TrustedKeyRegistry {
         }
     }
 
-    /// Adds a trusted Ed25519 public key under a policy-controlled key ID.
+    /// Adds a trusted Ed25519 public key and its immutable lifecycle under a
+    /// policy-controlled key ID.
     ///
     /// # Errors
     ///
-    /// Returns [`ApprovalError::MalformedToken`] for an invalid key ID.
+    /// Returns [`ApprovalError::MalformedToken`] for an invalid key ID,
+    /// [`ApprovalError::InvalidKeyLifecycle`] for invalid time bounds, or
+    /// [`ApprovalError::DuplicateKeyId`] when the ID is already present.
     pub fn insert(
         &mut self,
         key_id: impl Into<String>,
         key: VerifyingKey,
-    ) -> Result<Option<VerifyingKey>, ApprovalError> {
+        lifecycle: TrustedKeyLifecycle,
+    ) -> Result<(), ApprovalError> {
         let key_id = key_id.into();
         validate_key_id(&key_id)?;
-        Ok(self.keys.insert(key_id, key))
+        validate_key_lifecycle(lifecycle)?;
+        if self.keys.contains_key(&key_id) {
+            return Err(ApprovalError::DuplicateKeyId);
+        }
+        self.keys.insert(key_id, TrustedKey { key, lifecycle });
+        Ok(())
     }
 
-    fn get(&self, key_id: &str) -> Option<&VerifyingKey> {
+    fn get(&self, key_id: &str) -> Option<&TrustedKey> {
         self.keys.get(key_id)
     }
 }
@@ -376,6 +411,7 @@ impl ApprovalVerifier {
         let signature = Signature::from_slice(&signature_bytes)
             .map_err(|_| ApprovalError::MalformedToken("signature bytes are invalid"))?;
         trusted_key
+            .key
             .verify_strict(&payload, &signature)
             .map_err(|_| ApprovalError::InvalidSignature)?;
 
@@ -388,6 +424,7 @@ impl ApprovalVerifier {
         }
 
         self.validate_claims(&claims, request, accepted_types, now_unix_seconds)?;
+        validate_key_use(trusted_key.lifecycle, &claims, now_unix_seconds)?;
         self.replay_store
             .consume(
                 &claims.nonce,
@@ -425,7 +462,10 @@ impl ApprovalVerifier {
             .expires_at_unix_seconds
             .checked_sub(claims.issued_at_unix_seconds)
             .ok_or(ApprovalError::InvalidLifetime)?;
-        if lifetime <= 0 || lifetime > self.config.maximum_ttl_seconds {
+        if claims.issued_at_unix_seconds < 0
+            || lifetime <= 0
+            || lifetime > self.config.maximum_ttl_seconds
+        {
             return Err(ApprovalError::InvalidLifetime);
         }
         if claims.issued_at_unix_seconds
@@ -554,6 +594,44 @@ fn validate_key_id(key_id: &str) -> Result<(), ApprovalError> {
     Ok(())
 }
 
+fn validate_key_lifecycle(lifecycle: TrustedKeyLifecycle) -> Result<(), ApprovalError> {
+    if lifecycle.active_from_unix_seconds < 0
+        || lifecycle
+            .retire_at_unix_seconds
+            .is_some_and(|retirement| retirement <= lifecycle.active_from_unix_seconds)
+        || lifecycle
+            .revoke_at_unix_seconds
+            .is_some_and(|revocation| revocation <= lifecycle.active_from_unix_seconds)
+    {
+        return Err(ApprovalError::InvalidKeyLifecycle);
+    }
+    Ok(())
+}
+
+fn validate_key_use(
+    lifecycle: TrustedKeyLifecycle,
+    claims: &ApprovalClaimsV1,
+    now_unix_seconds: i64,
+) -> Result<(), ApprovalError> {
+    if now_unix_seconds < lifecycle.active_from_unix_seconds
+        || claims.issued_at_unix_seconds < lifecycle.active_from_unix_seconds
+    {
+        return Err(ApprovalError::KeyNotActive);
+    }
+    if lifecycle
+        .retire_at_unix_seconds
+        .is_some_and(|retirement| claims.issued_at_unix_seconds >= retirement)
+    {
+        return Err(ApprovalError::KeyRetired);
+    }
+    if lifecycle.revoke_at_unix_seconds.is_some_and(|revocation| {
+        now_unix_seconds >= revocation || claims.issued_at_unix_seconds >= revocation
+    }) {
+        return Err(ApprovalError::KeyRevoked);
+    }
+    Ok(())
+}
+
 fn validate_nonce(nonce: &str) -> Result<(), ApprovalError> {
     if nonce.len() < 16
         || nonce.len() > MAX_NONCE_BYTES
@@ -616,7 +694,8 @@ mod tests {
 
     use super::{
         ApprovalClaimsV1, ApprovalError, ApprovalVerifier, ApprovalVerifierConfig,
-        InMemoryReplayStore, SignedApprovalTokenV1, SqliteReplayStore, TrustedKeyRegistry,
+        InMemoryReplayStore, SignedApprovalTokenV1, SqliteReplayStore, TrustedKeyLifecycle,
+        TrustedKeyRegistry,
     };
     use crate::capability::{
         ApprovalType, CapabilityAction, ReadFileInput, RootedPath, WriteFileInput,
@@ -685,8 +764,22 @@ mod tests {
     }
 
     fn verifier(store: Arc<dyn super::ReplayStore>) -> Result<ApprovalVerifier, ApprovalError> {
+        verifier_with_lifecycle(
+            store,
+            TrustedKeyLifecycle {
+                active_from_unix_seconds: NOW - 10_000,
+                retire_at_unix_seconds: None,
+                revoke_at_unix_seconds: None,
+            },
+        )
+    }
+
+    fn verifier_with_lifecycle(
+        store: Arc<dyn super::ReplayStore>,
+        lifecycle: TrustedKeyLifecycle,
+    ) -> Result<ApprovalVerifier, ApprovalError> {
         let mut keys = TrustedKeyRegistry::new();
-        keys.insert(KEY_ID, signing_key().verifying_key())?;
+        keys.insert(KEY_ID, signing_key().verifying_key(), lifecycle)?;
         ApprovalVerifier::new(keys, store, ApprovalVerifierConfig::default())
     }
 
@@ -818,6 +911,147 @@ mod tests {
         assert!(matches!(
             verifier.verify_at(&token, &request, &[ApprovalType::Administrator], NOW),
             Err(ApprovalError::ApprovalTypeMismatch)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn enforces_key_activation_boundary_without_consuming_nonce() -> Result<(), Box<dyn Error>> {
+        let request = request();
+        let mut approval = claims(&request, "nonce-activation-01")?;
+        approval.issued_at_unix_seconds = NOW;
+        let token = sign(&approval)?;
+        let lifecycle = TrustedKeyLifecycle {
+            active_from_unix_seconds: NOW,
+            retire_at_unix_seconds: None,
+            revoke_at_unix_seconds: None,
+        };
+        let store = Arc::new(InMemoryReplayStore::default());
+        let early = verifier_with_lifecycle(store.clone(), lifecycle)?;
+        assert!(matches!(
+            early.verify_at(&token, &request, &[ApprovalType::ExplicitUser], NOW - 1),
+            Err(ApprovalError::KeyNotActive)
+        ));
+        let active = verifier_with_lifecycle(store, lifecycle)?;
+        assert!(
+            active
+                .verify_at(&token, &request, &[ApprovalType::ExplicitUser], NOW)
+                .is_ok()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retirement_blocks_new_issuance_but_honors_prior_short_lived_token()
+    -> Result<(), Box<dyn Error>> {
+        let request = request();
+        let lifecycle = TrustedKeyLifecycle {
+            active_from_unix_seconds: NOW - 10_000,
+            retire_at_unix_seconds: Some(NOW),
+            revoke_at_unix_seconds: None,
+        };
+        let mut prior = claims(&request, "nonce-retired-prior")?;
+        prior.issued_at_unix_seconds = NOW - 1;
+        let prior_token = sign(&prior)?;
+        let verifier =
+            verifier_with_lifecycle(Arc::new(InMemoryReplayStore::default()), lifecycle)?;
+        assert!(
+            verifier
+                .verify_at(&prior_token, &request, &[ApprovalType::ExplicitUser], NOW)
+                .is_ok()
+        );
+
+        let mut retired = claims(&request, "nonce-retired-new01")?;
+        retired.issued_at_unix_seconds = NOW;
+        let retired_token = sign(&retired)?;
+        let verifier =
+            verifier_with_lifecycle(Arc::new(InMemoryReplayStore::default()), lifecycle)?;
+        assert!(matches!(
+            verifier.verify_at(&retired_token, &request, &[ApprovalType::ExplicitUser], NOW),
+            Err(ApprovalError::KeyRetired)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn revocation_is_a_hard_cutoff_and_does_not_consume_nonce() -> Result<(), Box<dyn Error>> {
+        let request = request();
+        let token = sign(&claims(&request, "nonce-revoked-0001")?)?;
+        let shared_store = Arc::new(InMemoryReplayStore::default());
+        let revoked = verifier_with_lifecycle(
+            shared_store.clone(),
+            TrustedKeyLifecycle {
+                active_from_unix_seconds: NOW - 10_000,
+                retire_at_unix_seconds: None,
+                revoke_at_unix_seconds: Some(NOW),
+            },
+        )?;
+        assert!(matches!(
+            revoked.verify_at(&token, &request, &[ApprovalType::ExplicitUser], NOW),
+            Err(ApprovalError::KeyRevoked)
+        ));
+
+        let unrevoked = verifier_with_lifecycle(
+            shared_store,
+            TrustedKeyLifecycle {
+                active_from_unix_seconds: NOW - 10_000,
+                retire_at_unix_seconds: None,
+                revoke_at_unix_seconds: None,
+            },
+        )?;
+        assert!(
+            unrevoked
+                .verify_at(&token, &request, &[ApprovalType::ExplicitUser], NOW)
+                .is_ok()
+        );
+
+        let mut post_revocation = claims(&request, "nonce-revoked-future")?;
+        post_revocation.issued_at_unix_seconds = NOW + 10;
+        let post_revocation_token = sign(&post_revocation)?;
+        let scheduled = verifier_with_lifecycle(
+            Arc::new(InMemoryReplayStore::default()),
+            TrustedKeyLifecycle {
+                active_from_unix_seconds: NOW - 10_000,
+                retire_at_unix_seconds: None,
+                revoke_at_unix_seconds: Some(NOW + 10),
+            },
+        )?;
+        assert!(matches!(
+            scheduled.verify_at(
+                &post_revocation_token,
+                &request,
+                &[ApprovalType::ExplicitUser],
+                NOW
+            ),
+            Err(ApprovalError::KeyRevoked)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn registry_rejects_invalid_lifecycle_and_duplicate_key_id() -> Result<(), Box<dyn Error>> {
+        let mut keys = TrustedKeyRegistry::new();
+        assert!(matches!(
+            keys.insert(
+                KEY_ID,
+                signing_key().verifying_key(),
+                TrustedKeyLifecycle {
+                    active_from_unix_seconds: NOW,
+                    retire_at_unix_seconds: Some(NOW),
+                    revoke_at_unix_seconds: None,
+                }
+            ),
+            Err(ApprovalError::InvalidKeyLifecycle)
+        ));
+        let lifecycle = TrustedKeyLifecycle {
+            active_from_unix_seconds: NOW - 1,
+            retire_at_unix_seconds: None,
+            revoke_at_unix_seconds: None,
+        };
+        keys.insert(KEY_ID, signing_key().verifying_key(), lifecycle)?;
+        assert!(matches!(
+            keys.insert(KEY_ID, signing_key().verifying_key(), lifecycle),
+            Err(ApprovalError::DuplicateKeyId)
         ));
         Ok(())
     }

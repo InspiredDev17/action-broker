@@ -68,15 +68,16 @@ For a request requiring approval, the broker:
 2. resolves the capability descriptor and canonicalizes validated arguments and
    `ExecutionTarget`;
 3. parses the approval envelope with size and format bounds;
-4. selects a currently trusted verification key by policy;
+4. selects a configured verification key by exact key ID;
 5. verifies the Ed25519 signature over the exact canonical signed payload;
 6. validates version, issued-at/future bounds, expiry, and maximum token lifetime
    using the broker's clock policy;
 7. compares user, agent, task, capability, arguments digest, and target with the
    request using exact typed equality;
 8. checks that the approval type satisfies the action's effective risk policy;
-9. atomically inserts/consumes the nonce in the durable replay ledger; and
-10. records approval metadata in audit state before dispatch.
+9. enforces that key's activation, retirement, and revocation policy;
+10. atomically inserts/consumes the nonce in the durable replay ledger; and
+11. records approval metadata in audit state before dispatch.
 
 The broker never edits a request to make it fit a token. Any mismatch is a
 denial. Nonce consumption occurs only after the signature and bindings are
@@ -141,22 +142,50 @@ destination, or program absent from current permission policy.
 
 ## Key rotation and revocation
 
-The current trust set is the root-owned daemon configuration. Rotation may
-temporarily list old and new public keys, with overlap bounded operationally by
-the maximum approval lifetime. Removing a key invalidates its unexpired tokens
-after a validated daemon restart; live atomic key reload and per-key
-activation/retirement windows are not implemented in this foundation.
+The trust set and lifecycle policy are root-owned daemon configuration. Each key
+entry requires:
+
+- `active_from_unix_seconds`: inclusive broker-clock instant at which the key
+  and approvals issued under it may first be accepted;
+- `retire_at_unix_seconds`: optional exclusive issuance cutoff. Approvals issued
+  before it may complete their ordinary short lifetime; approvals issued at or
+  after it are rejected; and
+- `revoke_at_unix_seconds`: optional hard cutoff. At or after it, every approval
+  under the key is rejected regardless of issuance or expiration.
+
+Activation is checked against both broker time and signed `issued_at`. Retirement
+is checked against signed `issued_at`, permitting a deliberate overlap window
+without extending any token's normal TTL. Revocation is checked against broker
+time and signed issuance time. Lifecycle denial happens after signature and
+claims validation but before nonce consumption, so an inactive, retired, or
+revoked key cannot authorize execution and an invalid lifecycle attempt cannot
+burn a nonce.
+
+Key IDs are unique within a configuration; duplicate IDs, negative activation,
+and retirement/revocation instants at or before activation fail startup. Rotation
+lists old and new public keys simultaneously with non-overlapping issuance
+windows and a bounded validation overlap no longer than the maximum approval
+lifetime. Emergency response sets a hard revocation instant.
+
+Lifecycle configuration is immutable for the running daemon. A root-owned
+configuration change takes effect only after a validated restart; live atomic
+reload is not implemented. Removing a key also invalidates its tokens after
+restart, but explicit revocation preserves the reason and cutoff in reviewed
+configuration. Operators must keep approval-required execution stopped between
+deciding a revocation and completing the validated restart.
 
 Compromise response includes:
 
 1. disable approval-required execution;
-2. revoke the affected key ID/epoch;
+2. set a hard revocation cutoff for the affected key ID/epoch in root-owned
+   configuration;
 3. preserve ledger, audit, and Agent Green evidence;
 4. identify tokens and requests associated with the key without logging token
    bodies or signatures unnecessarily;
 5. rotate signing and verification material through the platform's key process;
 6. reconcile measurable side effects; and
-7. resume only after a known-good policy and ledger state is verified.
+7. restart and resume only after the known-good lifecycle policy, key material,
+   clock, and ledger state are verified.
 
 ## Audit and secret handling
 

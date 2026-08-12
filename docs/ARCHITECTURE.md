@@ -110,9 +110,11 @@ shell or a more powerful executor.
 ### Approval verifier and replay ledger
 
 Approval signatures use Ed25519 through a maintained library. The verifier
-checks the signed fields against the validated request and atomically consumes
-the nonce in durable storage before starting a consequential action. A token
-that has been consumed remains consumed even when execution later fails.
+checks the signed fields against the validated request, enforces the selected
+key's activation, issuance-retirement, and hard-revocation cutoffs, and
+atomically consumes the nonce in durable storage before starting a
+consequential action. A token that has been consumed remains consumed even when
+execution later fails. Lifecycle-invalid tokens are denied before consumption.
 
 ### Audit and Agent Green outputs
 
@@ -134,7 +136,7 @@ Agent Green collector received the event.
 | --- | --- | --- | --- |
 | TB1: proposal | LLM output | Personal AI Platform | typed schema, identity, permissions, approval UX |
 | TB2: local IPC | socket client | Action Broker daemon | socket ACL, frame bounds, schema validation, independent authorization |
-| TB3: authorization | signed request assertions | verifier/policy core | Ed25519 verification, exact field binding, expiry, durable nonce consumption |
+| TB3: authorization | signed request assertions | verifier/policy core | Ed25519 verification, exact field binding, expiry, key lifecycle, durable nonce consumption |
 | TB4: host effect | validated action | OS/filesystem/process | explicit roots, allowlists, least privilege, deadlines, resource/output bounds |
 | TB5: network | URL/DNS/redirect data | HTTP executor | destination policy on every resolution and redirect, address pinning |
 | TB6: telemetry | request/error/output data | audit and Agent Green | structured allowlisted fields, redaction, integrity chain, restricted storage |
@@ -153,8 +155,9 @@ Processing order is deterministic and fail closed:
 5. Canonicalize the validated arguments and calculate their digest; bind the
    validated target as a separate signed field.
 6. Evaluate risk, filesystem/network scope, timeout, and resource limits.
-7. When approval is required, verify the signature and all bindings, then
-   atomically consume the nonce in the durable replay ledger.
+7. When approval is required, verify the signature, claims, bindings, and
+   configured key lifecycle, then atomically consume the nonce in the durable
+   replay ledger.
 8. Create the initial audit record before dispatch.
 9. Dispatch only to the executor registered for that exact typed capability and
    execution target. A missing backend is a rejection.

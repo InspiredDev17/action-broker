@@ -65,6 +65,7 @@ corresponding security property.
 | Symlink/hard-link/mount escape | handle-relative lookup, link rejection where required, object identity checks, least-privilege service account | Bind mounts, network filesystems, hard links, and concurrent mount changes require deployment controls |
 | Secret access | secret-root deny policy, minimal broker account, no child inheritance, redacted output/audit | Secrets located inside an intentionally allowed root remain exposed unless classified and denied |
 | Approval tampering/substitution | library Ed25519 verification; canonical payload binds identity, task, capability, args, target, expiry, type, nonce | Compromised signing service can issue valid malicious approvals |
+| Stolen or retired approval key | required activation, exclusive issuance-retirement cutoff, hard revocation cutoff, bounded token TTL, root-owned immutable configuration | Lifecycle changes require a validated daemon restart; execution must stay stopped during emergency revocation |
 | Approval replay/race | durable transactional nonce ledger, atomic consume before dispatch | Restoring stale ledger state requires key/epoch invalidation before resuming |
 | Permission bypass | independent broker permission and descriptor checks; deny wins | Compromised policy/configuration authority can broaden access |
 | SSRF and DNS rebinding | scheme/host/port policy, all-address validation, address pinning, manual redirect validation, metadata/private/localhost denial | A permitted public service can proxy internally; use egress controls and destination trust review |
@@ -117,6 +118,7 @@ and the expected Agent Green event where applicable.
 | Environment injection | `PATH`, `LD_PRELOAD`, `DYLD_*`, proxy variables, inherited secret probes | Deny and child receives only allowlisted environment |
 | Approval replay | sequential, concurrent, and post-restart reuse | Exactly one atomic consume; subsequent requests denied with `replayed_approval` |
 | Approval tampering | change user, agent, task, capability, args, target, expiry, type, nonce, signature | Signature/binding denial; no nonce consumed for unauthenticated forgery |
+| Key lifecycle | pre-activation use, issuance at retirement boundary, use at revocation boundary, duplicate key ID, incoherent windows | Deterministic denial before nonce consumption; invalid configuration fails startup |
 | Timeout | silent hang, signal handling, descendant sleep | Bounded termination and truthful side-effect/audit state |
 | Output flooding | stdout, stderr, alternating streams, binary data | Memory and response stay bounded; truncation/digest recorded |
 | Fork/resource abuse | rapid descendants, memory/CPU/file-descriptor/file growth | Required host containment limits effect; otherwise capability disabled for that profile |
