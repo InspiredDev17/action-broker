@@ -34,8 +34,9 @@ The foundation consists of:
 - local executors for filesystem actions, read-only Git inspection, approved
   commands, HTTP requests, and policy-scoped Linux process inspection;
 - Ed25519 approval verification using a maintained cryptographic library and a
-  durable anti-replay ledger, with per-key activation, retirement, and hard
-  revocation enforcement;
+  durable bounded anti-replay ledger with expiry-safe pruning and clock-rollback
+  detection, plus per-key activation, retirement, and hard revocation
+  enforcement;
 - explicit filesystem root IDs backed by capability-oriented filesystem APIs;
 - destination validation, DNS resolution and address pinning, and manually
   validated redirects for HTTP;

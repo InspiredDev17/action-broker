@@ -119,6 +119,12 @@ key's activation, issuance-retirement, and hard-revocation cutoffs, and
 atomically consumes the nonce in durable storage before starting a
 consequential action. A token that has been consumed remains consumed even when
 execution later fails. Lifecycle-invalid tokens are denied before consumption.
+The SQLite ledger uses full synchronous durability, an expiry index, and an
+immediate transaction that safely prunes rows only after configured
+post-expiration retention. A hard row limit, startup integrity check, and
+required admission headroom make exhaustion or corruption fail closed. A
+durable wall-clock high-water mark also makes a backward clock step fail closed
+after any pruning decision.
 
 ### Audit and Agent Green outputs
 

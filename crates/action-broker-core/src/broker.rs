@@ -698,6 +698,10 @@ fn map_approval_error(error: &ApprovalError) -> BrokerError {
             ErrorCode::ApprovalReplayed,
             "approval has already been used",
         ),
+        ApprovalError::ReplayStoreCapacity => BrokerError::new(
+            ErrorCode::ResourceLimit,
+            "approval replay ledger capacity is exhausted",
+        ),
         ApprovalError::ReplayStoreUnavailable(_) => BrokerError::new(
             ErrorCode::ApprovalInvalid,
             "approval replay protection is unavailable",
@@ -987,6 +991,16 @@ mod tests {
         assert_eq!(
             security_event_kind(ErrorCode::UnexpectedPrivilegeElevation),
             Some(SecurityEventKind::UnexpectedPrivilegeElevation)
+        );
+    }
+
+    #[test]
+    fn replay_capacity_exhaustion_is_resource_abuse() {
+        let error = map_approval_error(&ApprovalError::ReplayStoreCapacity);
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert_eq!(
+            security_event_kind(error.code),
+            Some(SecurityEventKind::ResourceAbusePattern)
         );
     }
 

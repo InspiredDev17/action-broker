@@ -88,9 +88,10 @@ executor error cannot make the token usable again.
 ## Durable replay ledger
 
 The foundation stores consumed nonces in a durable SQLite ledger. Nonces are
-globally single-use within that ledger; the approval service must generate them
-with sufficient uniqueness across keys. A primary-key constraint and atomic
-insert make concurrent use deterministic: at most one request consumes a token.
+globally single-use while retained in that ledger; the approval service must
+generate them with sufficient uniqueness across keys. A primary-key constraint
+and `IMMEDIATE` transaction make concurrent use deterministic: at most one
+request consumes a token.
 
 Ledger requirements are:
 
@@ -98,10 +99,16 @@ Ledger requirements are:
 - written and synchronized according to the configured durability profile
   before a consequential executor starts;
 - inaccessible to socket clients and child processes;
-- retained at least through the maximum accepted token lifetime plus clock-skew
-  allowance and incident-response margin;
-- bounded and pruned only by a transaction that cannot remove a still-valid
-  nonce; and
+- retained through token expiry plus a configured one-hour-to-one-year
+  post-expiration interval (the one-hour floor exceeds the verifier's hard
+  clock-skew maximum and supplies incident-response margin);
+- bounded by a configured nonzero maximum of at most 10,000,000 rows and pruned
+  in the same write transaction only after the retention interval has elapsed;
+- failed closed before dispatch when the configured row capacity is exhausted;
+- checked for SQLite integrity and admission headroom at startup;
+- protected by a durable last-observed clock high-water mark so a backward
+  correction after pruning stops authorization instead of reopening a replay
+  window; and
 - included in backup/restore and disaster-recovery procedures.
 
 Restoring an old replay ledger can make previously consumed tokens appear
@@ -110,9 +117,10 @@ disabled, rotate/invalidate affected approval keys or epochs, and establish a
 safe ledger state before resuming. Audit records alone are not a race-safe
 replacement for the replay ledger.
 
-A replay attempt generates an Agent Green `replayed_approval` event. Ledger
-unavailability or durability failure is an authorization failure, never a reason
-to skip replay protection.
+A replay attempt generates an Agent Green `replayed_approval` event. Capacity
+exhaustion generates a `resource_abuse_pattern` event. Ledger unavailability or
+durability failure is an authorization failure, never a reason to skip replay
+protection.
 
 ## Expiry and clocks
 

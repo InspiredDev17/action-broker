@@ -23,7 +23,7 @@ regardless of representation, production configuration must provide:
 | Identity | distinct unprivileged broker UID and Platform UID; exact Platform UID -> user/agent mapping |
 | Socket | absolute path, broker-owned setgid directory, Platform access group, `0660` socket, frame/request bounds |
 | Approval trust | accepted token/schema versions, unique Ed25519 public-key IDs, required activation, optional retirement/revocation cutoffs, max lifetime and clock skew |
-| Replay | dedicated durable ledger path, permissions, synchronization/durability policy, retention |
+| Replay | dedicated durable ledger path, permissions, full synchronization, maximum rows, post-expiration retention |
 | Permissions | user/agent permission source and fail-closed refresh behavior |
 | Risk/approval | deterministic risk mapping and acceptable approval types |
 | Filesystem | explicit root ID -> opened directory mapping, operations, secret exclusions, per-root limits; repository roots and `.git` metadata broker/root-owned and non-writable by group/other |
@@ -105,6 +105,10 @@ fields:
 {
   "audit_initial_previous_hash": null,
   "agent_green_event_spool_maximum_bytes": 67108864,
+  "replay_ledger": {
+    "maximum_entries": 1000000,
+    "retention_after_expiration_seconds": 86400
+  },
   "process_inspection": {
     "enabled": false,
     "allowed_user_ids": [],
@@ -118,6 +122,19 @@ fields:
   }
 }
 ```
+
+`replay_ledger` is required. Its maximum must be nonzero and no greater than
+10,000,000 rows; post-expiration retention must be 3,600 through 31,536,000
+seconds. Startup runs SQLite `quick_check`, transactionally prunes only rows
+whose expiry plus retention is no later than the current time, and refuses a
+ledger with no admission headroom. Each nonce consumption repeats the same safe
+prune and capacity check inside an `IMMEDIATE`, fully synchronous transaction.
+Capacity exhaustion denies the action before dispatch and emits an Agent Green
+resource-abuse event; raising capacity requires storage planning, not deleting
+unexpired rows. The ledger persists its last observed wall time. If the clock
+moves backward, approval consumption remains disabled until operators verify
+time integrity and reconcile replay state; do not edit the high-water mark as a
+shortcut.
 
 `process_inspection` may be omitted only to select the same disabled default.
 Enabling it requires at least one UID, forbids UID 0, and never authorizes more

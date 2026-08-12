@@ -13,7 +13,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signature, VerifyingKey};
 use parking_lot::Mutex;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, TransactionBehavior, params};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -33,6 +33,9 @@ const MAX_KEY_ID_BYTES: usize = 64;
 const MAX_NONCE_BYTES: usize = 128;
 const HARD_MAXIMUM_TTL_SECONDS: i64 = 900;
 const HARD_MAXIMUM_CLOCK_SKEW_SECONDS: i64 = 60;
+const MAXIMUM_REPLAY_LEDGER_ENTRIES: u64 = 10_000_000;
+const MINIMUM_REPLAY_RETENTION_SECONDS: i64 = 3_600;
+const MAXIMUM_REPLAY_RETENTION_SECONDS: i64 = 31_536_000;
 
 /// Exact v1 claims signed by the platform approval service.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -125,6 +128,8 @@ pub enum ApprovalError {
     BindingMismatch { field: &'static str },
     #[error("approval token nonce has already been consumed")]
     ReplayDetected,
+    #[error("approval replay ledger capacity is exhausted")]
+    ReplayStoreCapacity,
     #[error("replay store is unavailable: {0}")]
     ReplayStoreUnavailable(String),
     #[error("system clock precedes the Unix epoch")]
@@ -139,8 +144,44 @@ pub enum ApprovalError {
 pub enum ReplayStoreError {
     #[error("nonce has already been consumed")]
     ReplayDetected,
+    #[error("replay ledger capacity is exhausted")]
+    CapacityExhausted,
     #[error("replay backend failure: {0}")]
     Backend(String),
+}
+
+/// Capacity and post-expiration retention for the durable replay ledger.
+/// Expired rows remain present for at least one hour, which exceeds the
+/// verifier's hard maximum clock skew and provides an incident-response margin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplayLedgerConfig {
+    pub maximum_entries: u64,
+    pub retention_after_expiration_seconds: i64,
+}
+
+impl Default for ReplayLedgerConfig {
+    fn default() -> Self {
+        Self {
+            maximum_entries: 1_000_000,
+            retention_after_expiration_seconds: 86_400,
+        }
+    }
+}
+
+impl ReplayLedgerConfig {
+    fn validate(self) -> Result<Self, ReplayStoreError> {
+        if self.maximum_entries == 0
+            || self.maximum_entries > MAXIMUM_REPLAY_LEDGER_ENTRIES
+            || self.retention_after_expiration_seconds < MINIMUM_REPLAY_RETENTION_SECONDS
+            || self.retention_after_expiration_seconds > MAXIMUM_REPLAY_RETENTION_SECONDS
+        {
+            return Err(ReplayStoreError::Backend(
+                "replay ledger limits are invalid".to_owned(),
+            ));
+        }
+        Ok(self)
+    }
 }
 
 /// Atomically records nonce consumption. Implementations must return exactly
@@ -151,7 +192,8 @@ pub trait ReplayStore: Send + Sync {
     /// # Errors
     ///
     /// Returns [`ReplayStoreError::ReplayDetected`] if the nonce is already
-    /// present, or [`ReplayStoreError::Backend`] on storage failure.
+    /// present, [`ReplayStoreError::CapacityExhausted`] at the configured hard
+    /// row ceiling, or [`ReplayStoreError::Backend`] on storage failure.
     fn consume(
         &self,
         nonce: &str,
@@ -164,6 +206,7 @@ pub trait ReplayStore: Send + Sync {
 /// atomic across threads, verifier instances, and processes using the same DB.
 pub struct SqliteReplayStore {
     connection: Mutex<Connection>,
+    config: ReplayLedgerConfig,
 }
 
 impl SqliteReplayStore {
@@ -174,8 +217,23 @@ impl SqliteReplayStore {
     /// Returns [`ReplayStoreError::Backend`] if `SQLite` cannot open or
     /// initialize the database.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ReplayStoreError> {
+        Self::open_with_config(path, ReplayLedgerConfig::default())
+    }
+
+    /// Opens or creates a durable replay database with explicit bounded
+    /// retention policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReplayStoreError::Backend`] for invalid limits or when
+    /// `SQLite` cannot open or initialize the database.
+    pub fn open_with_config(
+        path: impl AsRef<Path>,
+        config: ReplayLedgerConfig,
+    ) -> Result<Self, ReplayStoreError> {
+        let config = config.validate()?;
         let connection = Connection::open(path).map_err(|error| replay_backend(&error))?;
-        Self::from_connection(connection)
+        Self::from_connection(connection, config)
     }
 
     /// Creates a process-local `SQLite` replay database, intended for tests.
@@ -186,26 +244,187 @@ impl SqliteReplayStore {
     /// database.
     pub fn in_memory() -> Result<Self, ReplayStoreError> {
         let connection = Connection::open_in_memory().map_err(|error| replay_backend(&error))?;
-        Self::from_connection(connection)
+        Self::from_connection(connection, ReplayLedgerConfig::default())
     }
 
-    fn from_connection(connection: Connection) -> Result<Self, ReplayStoreError> {
+    fn from_connection(
+        connection: Connection,
+        config: ReplayLedgerConfig,
+    ) -> Result<Self, ReplayStoreError> {
+        let observed_at =
+            unix_time_now().map_err(|error| ReplayStoreError::Backend(error.to_string()))?;
+        Self::from_connection_at(connection, config, observed_at)
+    }
+
+    fn from_connection_at(
+        mut connection: Connection,
+        config: ReplayLedgerConfig,
+        observed_at_unix_seconds: i64,
+    ) -> Result<Self, ReplayStoreError> {
         connection
             .execute_batch(
                 "PRAGMA journal_mode = WAL;
                  PRAGMA synchronous = FULL;
+                 PRAGMA foreign_keys = ON;
                  CREATE TABLE IF NOT EXISTS consumed_approval_nonces (
                      nonce TEXT PRIMARY KEY NOT NULL,
                      request_id TEXT NOT NULL,
                      expires_at_unix_seconds INTEGER NOT NULL,
                      consumed_at_unix_seconds INTEGER NOT NULL
-                 ) WITHOUT ROWID;",
+                 ) WITHOUT ROWID;
+                 CREATE INDEX IF NOT EXISTS consumed_approval_nonces_expiry
+                 ON consumed_approval_nonces(expires_at_unix_seconds);
+                 CREATE TABLE IF NOT EXISTS replay_ledger_state (
+                     singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
+                     last_observed_unix_seconds INTEGER NOT NULL
+                 ) WITHOUT ROWID;
+                 INSERT OR IGNORE INTO replay_ledger_state
+                     (singleton, last_observed_unix_seconds) VALUES (1, 0);",
             )
+            .map_err(|error| replay_backend(&error))?;
+        let integrity: String = connection
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .map_err(|error| replay_backend(&error))?;
+        if integrity != "ok" {
+            return Err(ReplayStoreError::Backend(
+                "replay ledger integrity check failed".to_owned(),
+            ));
+        }
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| replay_backend(&error))?;
+        observe_clock_and_prune(
+            &transaction,
+            observed_at_unix_seconds,
+            config.retention_after_expiration_seconds,
+        )?;
+        let entries: i64 = transaction
+            .query_row("SELECT COUNT(*) FROM consumed_approval_nonces", [], |row| {
+                row.get(0)
+            })
+            .map_err(|error| replay_backend(&error))?;
+        let maximum_entries = i64::try_from(config.maximum_entries).map_err(|_| {
+            ReplayStoreError::Backend("replay ledger capacity is invalid".to_owned())
+        })?;
+        if entries >= maximum_entries {
+            return Err(ReplayStoreError::Backend(
+                "replay ledger has no safe admission headroom".to_owned(),
+            ));
+        }
+        transaction
+            .commit()
             .map_err(|error| replay_backend(&error))?;
         Ok(Self {
             connection: Mutex::new(connection),
+            config,
         })
     }
+
+    fn consume_at(
+        &self,
+        nonce: &str,
+        request_id: Uuid,
+        expires_at_unix_seconds: i64,
+        consumed_at_unix_seconds: i64,
+    ) -> Result<(), ReplayStoreError> {
+        let maximum_entries = i64::try_from(self.config.maximum_entries).map_err(|_| {
+            ReplayStoreError::Backend("replay ledger capacity is invalid".to_owned())
+        })?;
+        let mut connection = self.connection.lock();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| replay_backend(&error))?;
+        observe_clock_and_prune(
+            &transaction,
+            consumed_at_unix_seconds,
+            self.config.retention_after_expiration_seconds,
+        )?;
+        let already_consumed: bool = transaction
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM consumed_approval_nonces WHERE nonce = ?1
+                 )",
+                [nonce],
+                |row| row.get(0),
+            )
+            .map_err(|error| replay_backend(&error))?;
+        if already_consumed {
+            transaction
+                .commit()
+                .map_err(|error| replay_backend(&error))?;
+            return Err(ReplayStoreError::ReplayDetected);
+        }
+        let entries: i64 = transaction
+            .query_row("SELECT COUNT(*) FROM consumed_approval_nonces", [], |row| {
+                row.get(0)
+            })
+            .map_err(|error| replay_backend(&error))?;
+        if entries >= maximum_entries {
+            transaction
+                .commit()
+                .map_err(|error| replay_backend(&error))?;
+            return Err(ReplayStoreError::CapacityExhausted);
+        }
+        let changed = transaction
+            .execute(
+                "INSERT INTO consumed_approval_nonces
+                 (nonce, request_id, expires_at_unix_seconds, consumed_at_unix_seconds)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    nonce,
+                    request_id.to_string(),
+                    expires_at_unix_seconds,
+                    consumed_at_unix_seconds
+                ],
+            )
+            .map_err(|error| replay_backend(&error))?;
+        transaction
+            .commit()
+            .map_err(|error| replay_backend(&error))?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(ReplayStoreError::Backend(
+                "replay ledger insert did not consume one nonce".to_owned(),
+            ))
+        }
+    }
+}
+
+fn observe_clock_and_prune(
+    transaction: &rusqlite::Transaction<'_>,
+    observed_at_unix_seconds: i64,
+    retention_after_expiration_seconds: i64,
+) -> Result<(), ReplayStoreError> {
+    let last_observed: i64 = transaction
+        .query_row(
+            "SELECT last_observed_unix_seconds FROM replay_ledger_state
+             WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| replay_backend(&error))?;
+    if observed_at_unix_seconds < last_observed {
+        return Err(ReplayStoreError::Backend(
+            "system clock moved backward relative to replay ledger state".to_owned(),
+        ));
+    }
+    transaction
+        .execute(
+            "UPDATE replay_ledger_state SET last_observed_unix_seconds = ?1
+             WHERE singleton = 1",
+            [observed_at_unix_seconds],
+        )
+        .map_err(|error| replay_backend(&error))?;
+    let prune_before = observed_at_unix_seconds.saturating_sub(retention_after_expiration_seconds);
+    transaction
+        .execute(
+            "DELETE FROM consumed_approval_nonces
+             WHERE expires_at_unix_seconds <= ?1",
+            [prune_before],
+        )
+        .map_err(|error| replay_backend(&error))?;
+    Ok(())
 }
 
 impl ReplayStore for SqliteReplayStore {
@@ -217,28 +436,7 @@ impl ReplayStore for SqliteReplayStore {
     ) -> Result<(), ReplayStoreError> {
         let consumed_at =
             unix_time_now().map_err(|error| ReplayStoreError::Backend(error.to_string()))?;
-        let changed = self
-            .connection
-            .lock()
-            .execute(
-                "INSERT INTO consumed_approval_nonces
-                 (nonce, request_id, expires_at_unix_seconds, consumed_at_unix_seconds)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(nonce) DO NOTHING",
-                params![
-                    nonce,
-                    request_id.to_string(),
-                    expires_at_unix_seconds,
-                    consumed_at
-                ],
-            )
-            .map_err(|error| replay_backend(&error))?;
-
-        if changed == 1 {
-            Ok(())
-        } else {
-            Err(ReplayStoreError::ReplayDetected)
-        }
+        self.consume_at(nonce, request_id, expires_at_unix_seconds, consumed_at)
     }
 }
 
@@ -433,6 +631,7 @@ impl ApprovalVerifier {
             )
             .map_err(|error| match error {
                 ReplayStoreError::ReplayDetected => ApprovalError::ReplayDetected,
+                ReplayStoreError::CapacityExhausted => ApprovalError::ReplayStoreCapacity,
                 ReplayStoreError::Backend(message) => {
                     ApprovalError::ReplayStoreUnavailable(message)
                 }
@@ -689,13 +888,15 @@ mod tests {
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use ed25519_dalek::{Signer, SigningKey};
+    use rusqlite::{Connection, params};
     use tempfile::tempdir;
     use uuid::Uuid;
 
     use super::{
         ApprovalClaimsV1, ApprovalError, ApprovalVerifier, ApprovalVerifierConfig,
-        InMemoryReplayStore, SignedApprovalTokenV1, SqliteReplayStore, TrustedKeyLifecycle,
-        TrustedKeyRegistry,
+        InMemoryReplayStore, MINIMUM_REPLAY_RETENTION_SECONDS, ReplayLedgerConfig, ReplayStore,
+        ReplayStoreError, SignedApprovalTokenV1, SqliteReplayStore, TrustedKeyLifecycle,
+        TrustedKeyRegistry, unix_time_now,
     };
     use crate::capability::{
         ApprovalType, CapabilityAction, ReadFileInput, RootedPath, WriteFileInput,
@@ -1075,6 +1276,159 @@ mod tests {
         assert!(matches!(
             second.verify_at(&token, &request, &[ApprovalType::ExplicitUser], NOW),
             Err(ApprovalError::ReplayDetected)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn replay_ledger_limits_are_strict_and_unknown_fields_are_rejected() {
+        assert!(
+            ReplayLedgerConfig {
+                maximum_entries: 0,
+                retention_after_expiration_seconds: MINIMUM_REPLAY_RETENTION_SECONDS,
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            ReplayLedgerConfig {
+                maximum_entries: 1,
+                retention_after_expiration_seconds: MINIMUM_REPLAY_RETENTION_SECONDS - 1,
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<ReplayLedgerConfig>(
+                r#"{"maximum_entries":1000,"retention_after_expiration_seconds":3600,"bypass":true}"#,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn capacity_fails_closed_until_expiry_retention_has_elapsed() -> Result<(), Box<dyn Error>> {
+        let store = SqliteReplayStore::from_connection_at(
+            Connection::open_in_memory()?,
+            ReplayLedgerConfig {
+                maximum_entries: 1,
+                retention_after_expiration_seconds: MINIMUM_REPLAY_RETENTION_SECONDS,
+            },
+            10_000,
+        )?;
+        let request_id = Uuid::nil();
+        store.consume_at("nonce-capacity-0001", request_id, 9_000, 10_000)?;
+
+        assert!(matches!(
+            store.consume_at("nonce-capacity-0002", request_id, 20_000, 12_599),
+            Err(ReplayStoreError::CapacityExhausted)
+        ));
+        assert!(matches!(
+            store.consume_at("nonce-capacity-0001", request_id, 20_000, 12_599),
+            Err(ReplayStoreError::ReplayDetected)
+        ));
+        store.consume_at("nonce-capacity-0002", request_id, 20_000, 12_600)?;
+        assert!(matches!(
+            store.consume_at("nonce-capacity-0001", request_id, 20_000, 12_600),
+            Err(ReplayStoreError::CapacityExhausted)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn replay_ledger_clock_rollback_fails_closed() -> Result<(), Box<dyn Error>> {
+        let store = SqliteReplayStore::from_connection_at(
+            Connection::open_in_memory()?,
+            ReplayLedgerConfig {
+                maximum_entries: 2,
+                retention_after_expiration_seconds: MINIMUM_REPLAY_RETENTION_SECONDS,
+            },
+            10_000,
+        )?;
+        store.consume_at("nonce-clock-high-01", Uuid::nil(), 20_000, 20_000)?;
+        assert!(matches!(
+            store.consume_at("nonce-clock-back-01", Uuid::nil(), 20_000, 19_999),
+            Err(ReplayStoreError::Backend(_))
+        ));
+        store.consume_at("nonce-clock-next-01", Uuid::nil(), 21_000, 20_000)?;
+        Ok(())
+    }
+
+    #[test]
+    fn startup_rejects_full_or_malformed_replay_ledger() -> Result<(), Box<dyn Error>> {
+        let directory = tempdir()?;
+        let full_database = directory.path().join("full.sqlite3");
+        let initial = SqliteReplayStore::open_with_config(
+            &full_database,
+            ReplayLedgerConfig {
+                maximum_entries: 2,
+                retention_after_expiration_seconds: MINIMUM_REPLAY_RETENTION_SECONDS,
+            },
+        )?;
+        initial.consume(
+            "nonce-startup-full1",
+            Uuid::nil(),
+            unix_time_now()?.saturating_add(600),
+        )?;
+        drop(initial);
+        assert!(
+            SqliteReplayStore::open_with_config(
+                &full_database,
+                ReplayLedgerConfig {
+                    maximum_entries: 1,
+                    retention_after_expiration_seconds: MINIMUM_REPLAY_RETENTION_SECONDS,
+                },
+            )
+            .is_err()
+        );
+
+        let malformed_database = directory.path().join("malformed.sqlite3");
+        let malformed = Connection::open(&malformed_database)?;
+        malformed.execute_batch(
+            "CREATE TABLE consumed_approval_nonces (
+                 nonce TEXT PRIMARY KEY NOT NULL
+             ) WITHOUT ROWID;",
+        )?;
+        drop(malformed);
+        assert!(SqliteReplayStore::open(&malformed_database).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_replay_ledger_upgrades_without_forgetting_nonces() -> Result<(), Box<dyn Error>> {
+        let directory = tempdir()?;
+        let database = directory.path().join("legacy.sqlite3");
+        let legacy = Connection::open(&database)?;
+        legacy.execute_batch(
+            "CREATE TABLE consumed_approval_nonces (
+                 nonce TEXT PRIMARY KEY NOT NULL,
+                 request_id TEXT NOT NULL,
+                 expires_at_unix_seconds INTEGER NOT NULL,
+                 consumed_at_unix_seconds INTEGER NOT NULL
+             ) WITHOUT ROWID;",
+        )?;
+        let expires_at = unix_time_now()?.saturating_add(600);
+        legacy.execute(
+            "INSERT INTO consumed_approval_nonces VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "nonce-legacy-upgrade1",
+                Uuid::nil().to_string(),
+                expires_at,
+                1
+            ],
+        )?;
+        drop(legacy);
+
+        let upgraded = SqliteReplayStore::open_with_config(
+            &database,
+            ReplayLedgerConfig {
+                maximum_entries: 2,
+                retention_after_expiration_seconds: MINIMUM_REPLAY_RETENTION_SECONDS,
+            },
+        )?;
+        assert!(matches!(
+            upgraded.consume("nonce-legacy-upgrade1", Uuid::nil(), expires_at),
+            Err(ReplayStoreError::ReplayDetected)
         ));
         Ok(())
     }

@@ -11,8 +11,8 @@ use std::thread;
 use std::time::Duration;
 
 use action_broker_core::approval::{
-    ApprovalVerifier, ApprovalVerifierConfig, SqliteReplayStore, TrustedKeyLifecycle,
-    TrustedKeyRegistry,
+    ApprovalVerifier, ApprovalVerifierConfig, ReplayLedgerConfig, SqliteReplayStore,
+    TrustedKeyLifecycle, TrustedKeyRegistry,
 };
 use action_broker_core::audit::{HashChainedJsonlAuditSink, verify_audit_chain};
 use action_broker_core::broker::{ActionBroker, AuthenticatedRequester, BrokerLimits};
@@ -90,6 +90,7 @@ struct DaemonConfig {
     socket_group_id: u32,
     platform_peers: Vec<PlatformPeerConfig>,
     replay_database_path: PathBuf,
+    replay_ledger: ReplayLedgerConfig,
     audit_log_path: PathBuf,
     #[serde(default)]
     audit_initial_previous_hash: Option<String>,
@@ -267,12 +268,13 @@ fn build_broker(config: &DaemonConfig) -> Result<ActionBroker, BrokerError> {
             .map_err(|_| BrokerError::invalid("approval key configuration is invalid"))?;
     }
     let replay_store = Arc::new(
-        SqliteReplayStore::open(&config.replay_database_path).map_err(|_| {
-            BrokerError::new(
-                ErrorCode::ApprovalInvalid,
-                "approval replay database cannot be opened",
-            )
-        })?,
+        SqliteReplayStore::open_with_config(&config.replay_database_path, config.replay_ledger)
+            .map_err(|_| {
+                BrokerError::new(
+                    ErrorCode::ApprovalInvalid,
+                    "approval replay database cannot be opened",
+                )
+            })?,
     );
     let approvals = ApprovalVerifier::new(
         trusted_keys,
@@ -760,6 +762,20 @@ mod tests {
         assert!(decode_strict::<BrokerLimitsWireConfig>(missing_scope).is_err());
         let bypass = br#"{"maximum_concurrent_actions":8,"maximum_concurrent_actions_per_principal":4,"maximum_concurrent_actions_per_capability":4,"concurrency_wait_milliseconds":1000,"bypass":true}"#;
         assert!(decode_strict::<BrokerLimitsWireConfig>(bypass).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn replay_ledger_limits_are_required_and_strict() -> Result<(), Box<dyn Error>> {
+        let valid = br#"{"maximum_entries":1000000,"retention_after_expiration_seconds":86400}"#;
+        let decoded = decode_strict::<ReplayLedgerConfig>(valid)?;
+        assert_eq!(decoded.maximum_entries, 1_000_000);
+        assert_eq!(decoded.retention_after_expiration_seconds, 86_400);
+
+        let missing_retention = br#"{"maximum_entries":1000000}"#;
+        assert!(decode_strict::<ReplayLedgerConfig>(missing_retention).is_err());
+        let bypass = br#"{"maximum_entries":1000000,"retention_after_expiration_seconds":86400,"bypass":true}"#;
+        assert!(decode_strict::<ReplayLedgerConfig>(bypass).is_err());
         Ok(())
     }
 
