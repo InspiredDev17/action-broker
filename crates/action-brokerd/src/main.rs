@@ -1,0 +1,665 @@
+use std::collections::BTreeMap;
+use std::fs::{self, File};
+use std::io::{Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
+
+use action_broker_core::approval::{
+    ApprovalVerifier, ApprovalVerifierConfig, SqliteReplayStore, TrustedKeyRegistry,
+};
+use action_broker_core::audit::HashChainedJsonlAuditSink;
+use action_broker_core::broker::{ActionBroker, AuthenticatedRequester, BrokerLimits};
+use action_broker_core::command::{
+    ApprovedCommandExecutor, CancellationToken, CommandPolicyConfig,
+};
+use action_broker_core::error::{BrokerError, ErrorCode};
+use action_broker_core::filesystem::{FilesystemPolicyConfig, ScopedFilesystem};
+#[cfg(test)]
+use action_broker_core::model::{
+    ACTION_BROKER_PROTOCOL_VERSION, ActionErrorResponse, ActionStatus, ExecutionTarget,
+};
+use action_broker_core::model::{ActionRequest, ActionResponse};
+use action_broker_core::network::{NetworkPolicyConfig, SecureHttpClient};
+use action_broker_core::policy::{DeterministicPolicy, PolicyConfig};
+use action_broker_core::security_event::JsonlSecurityEventSink;
+use clap::{Parser, Subcommand};
+use ed25519_dalek::VerifyingKey;
+use rustix::process::{self, Uid};
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+#[cfg(test)]
+use uuid::Uuid;
+
+const MAX_FRAME_BYTES: usize = 1024 * 1024;
+const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+const MAX_KEY_BYTES: u64 = 4096;
+const SOCKET_MODE: u32 = 0o660;
+const MAX_OPEN_CONNECTIONS: usize = 128;
+
+struct ConnectionPermit(Arc<AtomicUsize>);
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "action-brokerd",
+    about = "Fail-closed local Action Broker daemon"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    Serve {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Prints capability descriptors; it never executes an action.
+    Capabilities,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DaemonConfig {
+    socket_path: PathBuf,
+    socket_group_id: u32,
+    platform_peers: Vec<PlatformPeerConfig>,
+    replay_database_path: PathBuf,
+    audit_log_path: PathBuf,
+    agent_green_event_spool_path: PathBuf,
+    approval_keys: Vec<ApprovalKeyConfig>,
+    approval_verifier: ApprovalVerifierWireConfig,
+    policy: PolicyConfig,
+    filesystem: FilesystemPolicyConfig,
+    commands: CommandPolicyConfig,
+    network: NetworkPolicyConfig,
+    broker_limits: BrokerLimitsWireConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlatformPeerConfig {
+    uid: u32,
+    user_id: String,
+    agent_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApprovalKeyConfig {
+    key_id: String,
+    public_key_path: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApprovalVerifierWireConfig {
+    maximum_ttl_seconds: i64,
+    allowed_clock_skew_seconds: i64,
+    maximum_payload_bytes: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrokerLimitsWireConfig {
+    maximum_concurrent_actions: usize,
+    concurrency_wait_milliseconds: u64,
+}
+
+fn main() {
+    let exit_code = match run() {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("action-brokerd failed: {error}");
+            1
+        }
+    };
+    std::process::exit(exit_code);
+}
+
+fn run() -> Result<(), BrokerError> {
+    match Cli::parse().command {
+        Command::Serve { config } => serve(&config),
+        Command::Capabilities => print_capabilities(),
+    }
+}
+
+fn print_capabilities() -> Result<(), BrokerError> {
+    use action_broker_core::capability::CapabilityKind;
+    let kinds = [
+        CapabilityKind::ReadFile,
+        CapabilityKind::WriteFile,
+        CapabilityKind::CreateFile,
+        CapabilityKind::MoveFile,
+        CapabilityKind::DeleteFile,
+        CapabilityKind::ListDirectory,
+        CapabilityKind::ExecuteApprovedCommand,
+        CapabilityKind::GitRead,
+        CapabilityKind::GitWrite,
+        CapabilityKind::HttpRequest,
+        CapabilityKind::BrowserAction,
+        CapabilityKind::ProcessInspect,
+        CapabilityKind::ServiceInspect,
+        CapabilityKind::ServiceControl,
+        CapabilityKind::ContainerAction,
+        CapabilityKind::NodeAction,
+    ];
+    let descriptors: Vec<_> = kinds.into_iter().map(CapabilityKind::descriptor).collect();
+    serde_json::to_writer_pretty(std::io::stdout().lock(), &descriptors)
+        .map_err(|_| BrokerError::new(ErrorCode::Internal, "descriptor serialization failed"))?;
+    println!();
+    Ok(())
+}
+
+fn serve(config_path: &Path) -> Result<(), BrokerError> {
+    refuse_root()?;
+    let config = read_secure_json::<DaemonConfig>(config_path, MAX_CONFIG_BYTES, "configuration")?;
+    let peer_principals = validate_platform_peers(&config.platform_peers)?;
+    validate_state_paths(&config)?;
+    let broker = Arc::new(build_broker(&config)?);
+    let listener = bind_socket(&config.socket_path, config.socket_group_id)?;
+    let open_connections = Arc::new(AtomicUsize::new(0));
+    for incoming in listener.incoming() {
+        let Ok(stream) = incoming else {
+            continue;
+        };
+        let Some(peer_uid) = peer_uid(&stream) else {
+            continue;
+        };
+        let Some(authenticated_requester) = peer_principals.get(&peer_uid).cloned() else {
+            continue;
+        };
+        if open_connections.load(Ordering::Acquire) >= MAX_OPEN_CONNECTIONS {
+            continue;
+        }
+        open_connections.fetch_add(1, Ordering::AcqRel);
+        let connection_permit = ConnectionPermit(Arc::clone(&open_connections));
+        let broker = Arc::clone(&broker);
+        thread::spawn(move || {
+            let _connection_permit = connection_permit;
+            let _ = handle_connection(broker, authenticated_requester, stream);
+        });
+    }
+    Err(BrokerError::new(
+        ErrorCode::Internal,
+        "Unix socket accept loop ended",
+    ))
+}
+
+fn build_broker(config: &DaemonConfig) -> Result<ActionBroker, BrokerError> {
+    let mut trusted_keys = TrustedKeyRegistry::new();
+    if config.approval_keys.is_empty() {
+        return Err(BrokerError::invalid(
+            "at least one approval verification key is required",
+        ));
+    }
+    for key in &config.approval_keys {
+        let bytes = read_secure_bytes(&key.public_key_path, MAX_KEY_BYTES, "approval public key")?;
+        let key_bytes = parse_public_key(&bytes)?;
+        let verifying_key = VerifyingKey::from_bytes(&key_bytes)
+            .map_err(|_| BrokerError::invalid("approval public key is invalid"))?;
+        trusted_keys
+            .insert(key.key_id.clone(), verifying_key)
+            .map_err(|_| BrokerError::invalid("approval key ID is invalid"))?;
+    }
+    let replay_store = Arc::new(
+        SqliteReplayStore::open(&config.replay_database_path).map_err(|_| {
+            BrokerError::new(
+                ErrorCode::ApprovalInvalid,
+                "approval replay database cannot be opened",
+            )
+        })?,
+    );
+    let approvals = ApprovalVerifier::new(
+        trusted_keys,
+        replay_store,
+        ApprovalVerifierConfig {
+            maximum_ttl_seconds: config.approval_verifier.maximum_ttl_seconds,
+            allowed_clock_skew_seconds: config.approval_verifier.allowed_clock_skew_seconds,
+            maximum_payload_bytes: config.approval_verifier.maximum_payload_bytes,
+        },
+    )
+    .map_err(|_| BrokerError::invalid("approval verifier configuration is invalid"))?;
+    let policy = DeterministicPolicy::from_config(config.policy.clone())?;
+    let filesystem = Arc::new(ScopedFilesystem::from_config(config.filesystem.clone())?);
+    let commands =
+        ApprovedCommandExecutor::from_config(Arc::clone(&filesystem), config.commands.clone())?;
+    let http = SecureHttpClient::new(config.network.clone())?;
+    let audit = Arc::new(HashChainedJsonlAuditSink::open(&config.audit_log_path)?);
+    let security_events = Arc::new(JsonlSecurityEventSink::open(
+        &config.agent_green_event_spool_path,
+    )?);
+    ActionBroker::new(
+        policy,
+        approvals,
+        filesystem,
+        commands,
+        http,
+        audit,
+        security_events,
+        BrokerLimits {
+            maximum_concurrent_actions: config.broker_limits.maximum_concurrent_actions,
+            concurrency_wait_milliseconds: config.broker_limits.concurrency_wait_milliseconds,
+        },
+    )
+}
+
+fn handle_connection(
+    broker: Arc<ActionBroker>,
+    authenticated_requester: AuthenticatedRequester,
+    mut stream: UnixStream,
+) -> Result<(), BrokerError> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|_| transport_error("socket read timeout setup failed"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .map_err(|_| transport_error("socket write timeout setup failed"))?;
+    let frame = read_frame(&mut stream)?;
+    let request: ActionRequest = decode_strict(&frame)?;
+    let cancellation = CancellationToken::new();
+    let worker_cancellation = cancellation.clone();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let response = broker.execute(request, &authenticated_requester, &worker_cancellation);
+        let _ = sender.send(response);
+    });
+    stream
+        .set_read_timeout(None)
+        .and_then(|()| stream.set_nonblocking(true))
+        .map_err(|_| transport_error("socket cancellation monitor setup failed"))?;
+    let response = loop {
+        match receiver.recv_timeout(Duration::from_millis(10)) {
+            Ok(response) => break response,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(transport_error("action worker stopped without a response"));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let mut probe = [0_u8; 1];
+                match stream.read(&mut probe) {
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    _ => cancellation.cancel(),
+                }
+            }
+        }
+    };
+    stream
+        .set_nonblocking(false)
+        .map_err(|_| transport_error("socket blocking mode restore failed"))?;
+    write_response(&mut stream, &response)
+}
+
+fn read_frame(stream: &mut impl Read) -> Result<Vec<u8>, BrokerError> {
+    let mut prefix = [0_u8; 4];
+    stream
+        .read_exact(&mut prefix)
+        .map_err(|_| transport_error("request frame prefix is incomplete"))?;
+    let length = usize::try_from(u32::from_be_bytes(prefix))
+        .map_err(|_| transport_error("request frame length is invalid"))?;
+    if length == 0 || length > MAX_FRAME_BYTES {
+        return Err(transport_error(
+            "request frame size is outside the safe bound",
+        ));
+    }
+    let mut frame = vec![0_u8; length];
+    stream
+        .read_exact(&mut frame)
+        .map_err(|_| transport_error("request frame is incomplete"))?;
+    Ok(frame)
+}
+
+fn write_response(stream: &mut UnixStream, response: &ActionResponse) -> Result<(), BrokerError> {
+    let bytes = serde_json::to_vec(response)
+        .map_err(|_| transport_error("response serialization failed"))?;
+    if bytes.len() > MAX_FRAME_BYTES {
+        return Err(transport_error("response frame exceeds the safe bound"));
+    }
+    let length = u32::try_from(bytes.len())
+        .map_err(|_| transport_error("response frame length is invalid"))?;
+    stream
+        .write_all(&length.to_be_bytes())
+        .and_then(|()| stream.write_all(&bytes))
+        .and_then(|()| stream.flush())
+        .map_err(|_| transport_error("response write failed"))
+}
+
+fn decode_strict<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, BrokerError> {
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let value = T::deserialize(&mut deserializer)
+        .map_err(|_| BrokerError::invalid("request JSON or schema is invalid"))?;
+    deserializer
+        .end()
+        .map_err(|_| BrokerError::invalid("request contains trailing data"))?;
+    Ok(value)
+}
+
+fn bind_socket(path: &Path, socket_group_id: u32) -> Result<UnixListener, BrokerError> {
+    if !path.is_absolute() {
+        return Err(BrokerError::invalid("socket path must be absolute"));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| BrokerError::invalid("socket parent directory is required"))?;
+    let parent_metadata = fs::symlink_metadata(parent)
+        .map_err(|_| transport_error("socket parent directory cannot be inspected"))?;
+    if parent_metadata.file_type().is_symlink()
+        || !parent_metadata.is_dir()
+        || parent_metadata.uid() != process::geteuid().as_raw()
+        || parent_metadata.gid() != socket_group_id
+        || parent_metadata.mode() & 0o027 != 0
+    {
+        return Err(transport_error("socket parent directory is unsafe"));
+    }
+    match fs::symlink_metadata(path) {
+        Ok(_) => return Err(transport_error("socket path already exists")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(transport_error("socket path cannot be inspected")),
+    }
+    let listener =
+        UnixListener::bind(path).map_err(|_| transport_error("Unix socket cannot be bound"))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(SOCKET_MODE))
+        .map_err(|_| transport_error("Unix socket permissions cannot be restricted"))?;
+    let socket_metadata = fs::symlink_metadata(path)
+        .map_err(|_| transport_error("Unix socket cannot be inspected after binding"))?;
+    if socket_metadata.uid() != process::geteuid().as_raw()
+        || socket_metadata.gid() != socket_group_id
+        || socket_metadata.mode() & 0o777 != SOCKET_MODE
+    {
+        let _ = fs::remove_file(path);
+        return Err(transport_error(
+            "Unix socket owner, group, or permissions are not the configured values",
+        ));
+    }
+    Ok(listener)
+}
+
+fn peer_uid(stream: &UnixStream) -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        return rustix::net::sockopt::socket_peercred(stream)
+            .ok()
+            .map(|credentials| credentials.uid.as_raw());
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = stream;
+        None
+    }
+}
+
+fn validate_platform_peers(
+    peers: &[PlatformPeerConfig],
+) -> Result<BTreeMap<u32, AuthenticatedRequester>, BrokerError> {
+    if peers.is_empty() {
+        return Err(BrokerError::invalid(
+            "at least one authenticated platform peer is required",
+        ));
+    }
+    let broker_uid = process::geteuid().as_raw();
+    let mut principals = BTreeMap::new();
+    for peer in peers {
+        if peer.uid == 0 || peer.uid == broker_uid {
+            return Err(BrokerError::invalid(
+                "platform peer UID must be unprivileged and distinct from the broker UID",
+            ));
+        }
+        let principal = AuthenticatedRequester {
+            user_id: peer.user_id.clone(),
+            agent_id: peer.agent_id.clone(),
+        };
+        if principals.insert(peer.uid, principal).is_some() {
+            return Err(BrokerError::invalid("duplicate platform peer UID"));
+        }
+    }
+    Ok(principals)
+}
+
+fn refuse_root() -> Result<(), BrokerError> {
+    if process::geteuid() == Uid::ROOT {
+        return Err(BrokerError::new(
+            ErrorCode::SandboxFailure,
+            "Action Broker refuses to run as root",
+        ));
+    }
+    Ok(())
+}
+
+fn read_secure_json<T: for<'de> Deserialize<'de>>(
+    path: &Path,
+    maximum_bytes: u64,
+    label: &'static str,
+) -> Result<T, BrokerError> {
+    let bytes = read_secure_bytes(path, maximum_bytes, label)?;
+    decode_strict(&bytes)
+}
+
+fn read_secure_bytes(
+    path: &Path,
+    maximum_bytes: u64,
+    label: &'static str,
+) -> Result<Vec<u8>, BrokerError> {
+    let before = fs::symlink_metadata(path)
+        .map_err(|_| BrokerError::invalid(format!("{label} cannot be inspected")))?;
+    if before.file_type().is_symlink()
+        || !before.is_file()
+        || before.uid() != 0
+        || before.mode() & 0o022 != 0
+        || before.len() > maximum_bytes
+    {
+        return Err(BrokerError::invalid(format!("{label} is unsafe")));
+    }
+    let file = File::options()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|_| BrokerError::invalid(format!("{label} cannot be opened")))?;
+    let after = file
+        .metadata()
+        .map_err(|_| BrokerError::invalid(format!("{label} cannot be inspected")))?;
+    if before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || after.uid() != 0
+        || after.mode() & 0o022 != 0
+        || after.len() > maximum_bytes
+    {
+        return Err(BrokerError::invalid(format!(
+            "{label} changed while opening"
+        )));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(after.len()).unwrap_or(0));
+    file.take(maximum_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|_| BrokerError::invalid(format!("{label} cannot be read")))?;
+    if bytes.len() as u64 > maximum_bytes {
+        return Err(BrokerError::invalid(format!(
+            "{label} exceeds the size limit"
+        )));
+    }
+    Ok(bytes)
+}
+
+fn parse_public_key(bytes: &[u8]) -> Result<[u8; 32], BrokerError> {
+    let trimmed = std::str::from_utf8(bytes)
+        .map_err(|_| BrokerError::invalid("approval public key is not UTF-8"))?
+        .trim();
+    let decoded = hex::decode(trimmed)
+        .map_err(|_| BrokerError::invalid("approval public key must be hexadecimal"))?;
+    decoded
+        .try_into()
+        .map_err(|_| BrokerError::invalid("approval public key must contain 32 bytes"))
+}
+
+fn validate_state_paths(config: &DaemonConfig) -> Result<(), BrokerError> {
+    let paths = [
+        &config.socket_path,
+        &config.replay_database_path,
+        &config.audit_log_path,
+        &config.agent_green_event_spool_path,
+    ];
+    if paths.iter().any(|path| !path.is_absolute()) {
+        return Err(BrokerError::invalid("broker state paths must be absolute"));
+    }
+    let digests: Vec<_> = paths
+        .iter()
+        .map(|path| Sha256::digest(path.as_os_str().as_encoded_bytes()))
+        .collect();
+    for (index, digest) in digests.iter().enumerate() {
+        if digests.iter().skip(index + 1).any(|other| other == digest) {
+            return Err(BrokerError::invalid("broker state paths must be distinct"));
+        }
+    }
+    prepare_owner_only_state_file(&config.replay_database_path, "replay database")?;
+    prepare_owner_only_state_file(&config.audit_log_path, "audit log")?;
+    prepare_owner_only_state_file(
+        &config.agent_green_event_spool_path,
+        "Agent Green event spool",
+    )?;
+    Ok(())
+}
+
+fn prepare_owner_only_state_file(path: &Path, label: &'static str) -> Result<(), BrokerError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| BrokerError::invalid(format!("{label} parent is missing")))?;
+    let parent_metadata = fs::symlink_metadata(parent)
+        .map_err(|_| BrokerError::invalid(format!("{label} parent cannot be inspected")))?;
+    let canonical_parent = fs::canonicalize(parent)
+        .map_err(|_| BrokerError::invalid(format!("{label} parent cannot be canonicalized")))?;
+    if parent_metadata.file_type().is_symlink()
+        || !parent_metadata.is_dir()
+        || canonical_parent != parent
+        || parent_metadata.uid() != process::geteuid().as_raw()
+        || parent_metadata.mode() & 0o077 != 0
+    {
+        return Err(BrokerError::invalid(format!("{label} parent is unsafe")));
+    }
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || metadata.uid() != process::geteuid().as_raw()
+                || metadata.mode() & 0o077 != 0
+            {
+                return Err(BrokerError::invalid(format!("{label} is unsafe")));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let file = File::options()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+                .map_err(|_| BrokerError::invalid(format!("{label} cannot be created")))?;
+            file.sync_all()
+                .map_err(|_| BrokerError::invalid(format!("{label} cannot be synced")))?;
+        }
+        Err(_) => return Err(BrokerError::invalid(format!("{label} cannot be inspected"))),
+    }
+    Ok(())
+}
+
+fn transport_error(message: &'static str) -> BrokerError {
+    BrokerError::new(ErrorCode::InvalidRequest, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+
+    use super::*;
+
+    #[test]
+    fn oversized_frame_is_rejected_without_allocating_payload() {
+        let mut frame = std::io::Cursor::new(u32::MAX.to_be_bytes());
+        assert!(read_frame(&mut frame).is_err());
+    }
+
+    #[test]
+    fn strict_decoder_rejects_unknown_fields() {
+        let request = br#"{"protocol_version":1,"request_id":"00000000-0000-0000-0000-000000000000","requester":{"user_id":"u","agent_id":"a","task_id":"t"},"target":{"type":"local"},"action":{"capability":"ReadFile","arguments":{"path":{"root_id":"r","relative_path":"f"},"maximum_bytes":1}},"approval_token":null,"hidden_bypass":true}"#;
+        assert!(decode_strict::<ActionRequest>(request).is_err());
+    }
+
+    #[test]
+    fn framed_response_round_trips_across_unix_socket() -> Result<(), Box<dyn Error>> {
+        let request_id = Uuid::from_u128(42);
+        let response = ActionResponse {
+            protocol_version: ACTION_BROKER_PROTOCOL_VERSION,
+            request_id,
+            target: ExecutionTarget::Node {
+                node_id: "node-7".to_owned(),
+            },
+            capability: action_broker_core::capability::CapabilityKind::NodeAction,
+            status: ActionStatus::Rejected,
+            output: None,
+            error: Some(ActionErrorResponse {
+                code: "permission_denied".to_owned(),
+                message: "request was not authorized".to_owned(),
+                retryable: false,
+            }),
+            started_at_unix_milliseconds: 100,
+            finished_at_unix_milliseconds: 101,
+            output_sha256: None,
+        };
+        let (mut server, mut client) = UnixStream::pair()?;
+
+        write_response(&mut server, &response)?;
+        let frame = read_frame(&mut client)?;
+        let decoded = decode_strict::<ActionResponse>(&frame)?;
+
+        assert_eq!(decoded, response);
+        assert_eq!(decoded.request_id, request_id);
+        Ok(())
+    }
+
+    #[test]
+    fn incomplete_frame_is_rejected() {
+        let mut frame = std::io::Cursor::new([0, 0, 0, 4, b'{', b'}']);
+        assert!(read_frame(&mut frame).is_err());
+    }
+
+    #[test]
+    fn strict_decoder_rejects_trailing_protocol_data() {
+        let response = br#"{"protocol_version":1,"request_id":"00000000-0000-0000-0000-000000000000","target":{"type":"local"},"capability":"ReadFile","status":"rejected","output":null,"error":{"code":"invalid_request","message":"bad","retryable":false},"started_at_unix_milliseconds":0,"finished_at_unix_milliseconds":0,"output_sha256":null}{}"#;
+        assert!(decode_strict::<ActionResponse>(response).is_err());
+    }
+
+    #[test]
+    fn platform_peer_must_be_distinct_and_maps_one_principal() -> Result<(), Box<dyn Error>> {
+        let broker_uid = process::geteuid().as_raw();
+        assert!(
+            validate_platform_peers(&[PlatformPeerConfig {
+                uid: broker_uid,
+                user_id: "user".to_owned(),
+                agent_id: "agent".to_owned(),
+            }])
+            .is_err()
+        );
+        let candidate = if broker_uid == 1 { 2 } else { 1 };
+        let peers = validate_platform_peers(&[PlatformPeerConfig {
+            uid: candidate,
+            user_id: "user".to_owned(),
+            agent_id: "agent".to_owned(),
+        }])?;
+        assert_eq!(
+            peers.get(&candidate),
+            Some(&AuthenticatedRequester {
+                user_id: "user".to_owned(),
+                agent_id: "agent".to_owned(),
+            })
+        );
+        Ok(())
+    }
+}

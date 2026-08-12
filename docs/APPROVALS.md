@@ -1,0 +1,182 @@
+# Approval Tokens
+
+## Purpose
+
+Permissions answer whether a user/agent may request a class of action. Approval
+tokens answer whether the approval service authorized this exact consequential
+action for a short period. An approval is neither a session credential nor a
+general delegation.
+
+A valid token is necessary only where policy requires it, and is never
+sufficient on its own. The broker also enforces current identity, permission,
+risk, target, scope, sandbox, and capability policy.
+
+## Signed bindings
+
+The signed payload binds at least:
+
+| Field | Security purpose |
+| --- | --- |
+| Token/schema version | Prevents ambiguous interpretation across protocol changes |
+| Request ID | Binds the approval to one request envelope |
+| User ID | Binds the approving/requesting user identity |
+| Agent ID | Prevents transfer to another agent |
+| Task ID | Limits authority to one task context |
+| Capability | Prevents capability substitution |
+| Arguments digest | Binds canonical validated arguments, including omitted/default semantics |
+| Target | Binds local vs node execution and exact target identity |
+| Issued at | Supports maximum-lifetime and future-token checks |
+| Expiration | Bounds exposure; the maximum lifetime is broker policy |
+| Approval type | Must satisfy the deterministic risk policy |
+| Nonce | Provides single-use replay protection |
+
+Deployment policy may additionally require issuer, audience, and not-before
+fields. Adding a field must be versioned and included inside the
+signed canonical payload, not supplied as unsigned envelope metadata.
+
+The arguments digest is SHA-256 over RFC 8785/JCS serialization of the validated
+typed arguments, not raw client JSON. Security-relevant defaults must therefore
+be represented consistently. Changes in whitespace or field order do not
+change the digest; the separately signed capability and token version prevent
+the same arguments from being substituted into another capability/version.
+
+## Envelope and cryptography
+
+The compact v1 token is
+`ab1.<key-id>.<base64url(JCS claims)>.<base64url(signature)>`. The key ID routes
+verification to an administratively trusted public key; the signature covers
+the exact canonical claims bytes. Changing the key ID cannot make an invalid
+signature valid under the selected trusted key.
+
+Signatures use Ed25519 through a maintained cryptographic library. Action Broker
+does not implement curve arithmetic, hashing constructions, signature parsing,
+or constant-time primitives from scratch.
+
+The approval service holds signing keys. The broker receives verification keys
+only. Verification keys are loaded from a restricted configuration source and
+selected by key ID from an explicit trust set; clients cannot add a trusted key.
+
+Signature encoding is strict and canonical. Malformed, noncanonical, unknown
+version, unknown key, or invalid signature inputs are rejected without exposing
+which internal verification step failed to an untrusted client.
+
+## Verification sequence
+
+For a request requiring approval, the broker:
+
+1. validates request framing and the typed capability schema;
+2. resolves the capability descriptor and canonicalizes validated arguments and
+   `ExecutionTarget`;
+3. parses the approval envelope with size and format bounds;
+4. selects a currently trusted verification key by policy;
+5. verifies the Ed25519 signature over the exact canonical signed payload;
+6. validates version, issued-at/future bounds, expiry, and maximum token lifetime
+   using the broker's clock policy;
+7. compares user, agent, task, capability, arguments digest, and target with the
+   request using exact typed equality;
+8. checks that the approval type satisfies the action's effective risk policy;
+9. atomically inserts/consumes the nonce in the durable replay ledger; and
+10. records approval metadata in audit state before dispatch.
+
+The broker never edits a request to make it fit a token. Any mismatch is a
+denial. Nonce consumption occurs only after the signature and bindings are
+valid, so an unauthenticated caller cannot burn arbitrary signed nonces by
+guessing them. It occurs before execution, so a crash, timeout, cancellation, or
+executor error cannot make the token usable again.
+
+## Durable replay ledger
+
+The foundation stores consumed nonces in a durable SQLite ledger. Nonces are
+globally single-use within that ledger; the approval service must generate them
+with sufficient uniqueness across keys. A primary-key constraint and atomic
+insert make concurrent use deterministic: at most one request consumes a token.
+
+Ledger requirements are:
+
+- durable across daemon restarts and process crashes;
+- written and synchronized according to the configured durability profile
+  before a consequential executor starts;
+- inaccessible to socket clients and child processes;
+- retained at least through the maximum accepted token lifetime plus clock-skew
+  allowance and incident-response margin;
+- bounded and pruned only by a transaction that cannot remove a still-valid
+  nonce; and
+- included in backup/restore and disaster-recovery procedures.
+
+Restoring an old replay ledger can make previously consumed tokens appear
+unused. After a rollback or uncertain restore, operators must keep execution
+disabled, rotate/invalidate affected approval keys or epochs, and establish a
+safe ledger state before resuming. Audit records alone are not a race-safe
+replacement for the replay ledger.
+
+A replay attempt generates an Agent Green `replayed_approval` event. Ledger
+unavailability or durability failure is an authorization failure, never a reason
+to skip replay protection.
+
+## Expiry and clocks
+
+Tokens are deliberately short-lived. Broker configuration sets a maximum token
+lifetime and bounded allowed clock skew; a token cannot request a longer window.
+The expiration check occurs before nonce consumption and again immediately
+before dispatch if validation or queuing could cross the deadline.
+
+Expired tokens generate an `expired_approval` event. A wall-clock jump is
+security-relevant: the daemon should use a monitored trusted time source and a
+monotonic clock for elapsed execution deadlines. When wall-clock correctness is
+uncertain beyond configured skew, approval-required operations fail closed.
+
+## Approval types
+
+Approval types are stable, machine-readable policy values rather than free-form
+labels. Protocol version 1 recognizes `EXPLICIT_USER`, `ELEVATED_USER`, and
+`ADMINISTRATOR`. Bounded read-only descriptors may instead declare `PolicyOnly`,
+which means permission and deterministic policy are sufficient and no token is
+accepted as a substitute for missing permission. The policy maps each effective
+risk and target to an explicit set of accepted types.
+
+Approval ordering is explicit in configuration/code. String ordering or client
+claims never establish that one type is stronger than another. A standing grant
+must still be narrowly scoped and cannot authorize a capability, root,
+destination, or program absent from current permission policy.
+
+## Key rotation and revocation
+
+The current trust set is the root-owned daemon configuration. Rotation may
+temporarily list old and new public keys, with overlap bounded operationally by
+the maximum approval lifetime. Removing a key invalidates its unexpired tokens
+after a validated daemon restart; live atomic key reload and per-key
+activation/retirement windows are not implemented in this foundation.
+
+Compromise response includes:
+
+1. disable approval-required execution;
+2. revoke the affected key ID/epoch;
+3. preserve ledger, audit, and Agent Green evidence;
+4. identify tokens and requests associated with the key without logging token
+   bodies or signatures unnecessarily;
+5. rotate signing and verification material through the platform's key process;
+6. reconcile measurable side effects; and
+7. resume only after a known-good policy and ledger state is verified.
+
+## Audit and secret handling
+
+Audit records include whether approval was required, its verified key ID,
+approval type, and a SHA-256 digest of the compact token for correlation. They
+do not currently record a separate nonce digest or token expiry. They never
+include signing keys, full bearer tokens,
+signatures, secrets embedded in inputs, or raw approval-service responses.
+
+Approval tampering, invalid binding, expiry, replay, and permission bypass
+attempts produce structured Agent Green events with redacted identifiers. Event
+delivery cannot be disabled by the request that caused the event.
+
+## Non-goals
+
+Approval tokens do not:
+
+- authenticate the human approval user interface by themselves;
+- make an unsafe capability implementation safe;
+- make external side effects reversible;
+- authorize privilege escalation or an unavailable sandbox;
+- replace transport access controls, permissions, or deterministic policy; or
+- allow the broker to execute arbitrary natural-language instructions.

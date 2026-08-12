@@ -1,0 +1,1 @@
+{"protocol_version":1,"request_id":"018f47d2-60d2-7af0-bc35-2a1f7f5a6d01","requester":{"user_id":"user-1","agent_id":"agent-1","task_id":"task-1"},"target":{"type":"local"},"action":{"capability":"ReadFile","arguments":{"path":{"root_id":"workspace","relative_path":"report.txt"},"maximum_bytes":4096}},"approval_token":null}

@@ -1,0 +1,23 @@
+[package]
+name = "action-brokerd"
+description = "Local Unix-socket daemon for Action Broker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+action-broker-core = { path = "../action-broker-core" }
+clap.workspace = true
+ed25519-dalek.workspace = true
+hex.workspace = true
+libc.workspace = true
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

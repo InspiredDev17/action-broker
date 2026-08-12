@@ -1,0 +1,7 @@
+/target/
+*.db
+*.db-shm
+*.db-wal
+*.sock
+*.log
+.DS_Store
