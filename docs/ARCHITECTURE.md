@@ -129,6 +129,12 @@ file changes, and contacted network destinations. Audit records form a hash
 chain so deletion or reordering is detectable when the chain head is anchored
 outside the file.
 
+Audit parsing is strict and bounded. Startup and the read-only `verify-audit`
+operator command reject unknown fields, oversized or incomplete records,
+symlinks, same-path object replacement, broken hashes, and files that change
+during validation. A rotated segment is configured with the exact final head
+of its predecessor; genesis is valid only for the first segment.
+
 Security-relevant rejections and sandbox failures also go to a mandatory local
 Agent Green spool. The request and capability schemas contain no switch that can
 disable this path. Local spooling is a durable handoff, not proof that a remote

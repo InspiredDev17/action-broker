@@ -120,6 +120,17 @@ docs/                        architecture, security, and operating guidance
 
 The production runtime has no TypeScript and no Python dependency.
 
+Audit segments can be verified without serving requests or modifying state:
+
+```text
+action-brokerd verify-audit --path /var/lib/action-broker/audit.jsonl
+```
+
+For rotated segments, pass the prior segment head with
+`--initial-previous-head`; pass an independently protected checkpoint with
+`--expected-head`. Verification emits only record count, chain heads, and time
+bounds.
+
 ## Development
 
 Use the repository toolchains to build and test the complete workspace:

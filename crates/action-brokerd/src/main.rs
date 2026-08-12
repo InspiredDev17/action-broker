@@ -14,7 +14,7 @@ use action_broker_core::approval::{
     ApprovalVerifier, ApprovalVerifierConfig, SqliteReplayStore, TrustedKeyLifecycle,
     TrustedKeyRegistry,
 };
-use action_broker_core::audit::HashChainedJsonlAuditSink;
+use action_broker_core::audit::{HashChainedJsonlAuditSink, verify_audit_chain};
 use action_broker_core::broker::{ActionBroker, AuthenticatedRequester, BrokerLimits};
 use action_broker_core::command::{
     ApprovedCommandExecutor, CancellationToken, CommandPolicyConfig,
@@ -70,6 +70,17 @@ enum Command {
     },
     /// Prints capability descriptors; it never executes an action.
     Capabilities,
+    /// Verifies one audit segment without modifying it or executing an action.
+    VerifyAudit {
+        #[arg(long)]
+        path: PathBuf,
+        /// Prior segment head; omit only for the first genesis segment.
+        #[arg(long)]
+        initial_previous_head: Option<String>,
+        /// Optional independently protected lowercase SHA-256 chain head.
+        #[arg(long)]
+        expected_head: Option<String>,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,6 +91,8 @@ struct DaemonConfig {
     platform_peers: Vec<PlatformPeerConfig>,
     replay_database_path: PathBuf,
     audit_log_path: PathBuf,
+    #[serde(default)]
+    audit_initial_previous_hash: Option<String>,
     agent_green_event_spool_path: PathBuf,
     approval_keys: Vec<ApprovalKeyConfig>,
     approval_verifier: ApprovalVerifierWireConfig,
@@ -142,7 +155,28 @@ fn run() -> Result<(), BrokerError> {
     match Cli::parse().command {
         Command::Serve { config } => serve(&config),
         Command::Capabilities => print_capabilities(),
+        Command::VerifyAudit {
+            path,
+            initial_previous_head,
+            expected_head,
+        } => print_audit_verification(
+            &path,
+            initial_previous_head.as_deref(),
+            expected_head.as_deref(),
+        ),
     }
+}
+
+fn print_audit_verification(
+    path: &Path,
+    initial_previous_head: Option<&str>,
+    expected_head: Option<&str>,
+) -> Result<(), BrokerError> {
+    let summary = verify_audit_chain(path, initial_previous_head, expected_head)?;
+    serde_json::to_writer_pretty(std::io::stdout().lock(), &summary)
+        .map_err(|_| BrokerError::new(ErrorCode::Internal, "audit summary serialization failed"))?;
+    println!();
+    Ok(())
 }
 
 fn print_capabilities() -> Result<(), BrokerError> {
@@ -256,7 +290,12 @@ fn build_broker(config: &DaemonConfig) -> Result<ActionBroker, BrokerError> {
     let http = SecureHttpClient::new(config.network.clone())?;
     let process_inspection =
         ProcessInspectExecutor::from_config(config.process_inspection.clone())?;
-    let audit = Arc::new(HashChainedJsonlAuditSink::open(&config.audit_log_path)?);
+    let audit = Arc::new(match config.audit_initial_previous_hash.as_deref() {
+        Some(initial_hash) => {
+            HashChainedJsonlAuditSink::open_with_initial_hash(&config.audit_log_path, initial_hash)?
+        }
+        None => HashChainedJsonlAuditSink::open(&config.audit_log_path)?,
+    });
     let security_events = Arc::new(JsonlSecurityEventSink::open(
         &config.agent_green_event_spool_path,
     )?);
@@ -605,6 +644,35 @@ mod tests {
     use std::error::Error;
 
     use super::*;
+
+    #[test]
+    fn audit_verification_cli_binds_both_segment_heads() -> Result<(), Box<dyn Error>> {
+        let prior = "a".repeat(64);
+        let final_head = "b".repeat(64);
+        let cli = Cli::try_parse_from([
+            "action-brokerd",
+            "verify-audit",
+            "--path",
+            "/var/lib/action-broker/audit.jsonl",
+            "--initial-previous-head",
+            &prior,
+            "--expected-head",
+            &final_head,
+        ])?;
+        match cli.command {
+            Command::VerifyAudit {
+                path,
+                initial_previous_head,
+                expected_head,
+            } => {
+                assert_eq!(path, Path::new("/var/lib/action-broker/audit.jsonl"));
+                assert_eq!(initial_previous_head.as_deref(), Some(prior.as_str()));
+                assert_eq!(expected_head.as_deref(), Some(final_head.as_str()));
+            }
+            _ => return Err("unexpected command".into()),
+        }
+        Ok(())
+    }
 
     #[test]
     fn oversized_frame_is_rejected_without_allocating_payload() {

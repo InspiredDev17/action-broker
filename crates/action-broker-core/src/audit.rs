@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -13,7 +13,9 @@ use uuid::Uuid;
 use crate::error::{BrokerError, BrokerResult, ErrorCode};
 
 const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
-const MAX_AUDIT_LINE_BYTES: u64 = 256 * 1024;
+const MAX_AUDIT_LINE_BYTES: usize = 256 * 1024;
+const MAX_AUDIT_FILE_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_AUDIT_RECORDS: u64 = 4_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -23,6 +25,7 @@ pub enum AuditPhase {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApprovalAudit {
     pub required: bool,
     pub approval_type: Option<String>,
@@ -31,6 +34,7 @@ pub struct ApprovalAudit {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FileChangeAudit {
     pub root_id: String,
     pub relative_path_digest: String,
@@ -42,6 +46,7 @@ pub struct FileChangeAudit {
 /// Caller-controlled content and secret values must be represented only by
 /// digests before reaching this structure.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuditEvent {
     pub version: u8,
     pub audit_id: Uuid,
@@ -64,6 +69,7 @@ pub struct AuditEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ChainedAuditEvent {
     previous_hash: String,
     event: AuditEvent,
@@ -74,9 +80,37 @@ pub trait AuditSink: Send + Sync {
     fn record(&self, event: &AuditEvent) -> BrokerResult<()>;
 }
 
+/// Secret-free result of validating one complete audit segment. Operators can
+/// compare `head_sha256` with an independently protected checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditVerificationSummary {
+    pub record_count: u64,
+    pub initial_previous_sha256: String,
+    pub head_sha256: String,
+    pub first_event_at_unix_ms: Option<i128>,
+    pub last_event_at_unix_ms: Option<i128>,
+}
+
 struct AuditWriter {
     writer: BufWriter<File>,
     previous_hash: String,
+    record_count: u64,
+    current_bytes: u64,
+    #[cfg(unix)]
+    file_stamp: FileStamp,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    device: u64,
+    inode: u64,
+    length: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
 }
 
 /// Append-only, hash-chained JSONL audit log. The chain detects truncation or
@@ -88,23 +122,55 @@ pub struct HashChainedJsonlAuditSink {
 
 impl HashChainedJsonlAuditSink {
     pub fn open(path: &Path) -> BrokerResult<Self> {
-        reject_unsafe_existing_file(path)?;
-        let previous_hash = validate_existing_chain(path)?;
-        let mut options = OpenOptions::new();
-        options.create(true).append(true);
+        Self::open_with_initial_hash(path, GENESIS_HASH)
+    }
+
+    /// Opens an append-only segment whose first record must extend the supplied
+    /// prior segment head. The all-zero genesis hash is used only for the first
+    /// segment in a chain.
+    pub fn open_with_initial_hash(path: &Path, initial_previous_hash: &str) -> BrokerResult<Self> {
+        validate_hash(initial_previous_hash, "initial audit head is invalid")?;
+        let file = open_audit_file(path, true)?;
+        let summary = validate_existing_chain(&file, initial_previous_hash)?;
+        let current_bytes = file
+            .metadata()
+            .map_err(|_| audit_error("audit log metadata failed"))?
+            .len();
         #[cfg(unix)]
-        options.mode(0o600);
-        let file = options
-            .open(path)
-            .map_err(|_| audit_error("audit log cannot be opened"))?;
-        verify_private_file(&file)?;
+        let file_stamp = file_stamp(&file)?;
         Ok(Self {
             state: Mutex::new(AuditWriter {
                 writer: BufWriter::new(file),
-                previous_hash,
+                previous_hash: summary.head_sha256,
+                record_count: summary.record_count,
+                current_bytes,
+                #[cfg(unix)]
+                file_stamp,
             }),
         })
     }
+}
+
+/// Validates a complete audit segment without modifying it. When supplied, the
+/// expected head must be the exact lowercase SHA-256 checkpoint for this file.
+pub fn verify_audit_chain(
+    path: &Path,
+    initial_previous_hash: Option<&str>,
+    expected_head: Option<&str>,
+) -> BrokerResult<AuditVerificationSummary> {
+    let initial_previous_hash = initial_previous_hash.unwrap_or(GENESIS_HASH);
+    validate_hash(initial_previous_hash, "initial audit head is invalid")?;
+    if let Some(expected) = expected_head {
+        validate_hash(expected, "expected audit head is invalid")?;
+    }
+    let file = open_audit_file(path, false)?;
+    let summary = validate_existing_chain(&file, initial_previous_hash)?;
+    if expected_head.is_some_and(|expected| expected != summary.head_sha256) {
+        return Err(audit_error(
+            "audit chain head does not match the external checkpoint",
+        ));
+    }
+    Ok(summary)
 }
 
 impl AuditSink for HashChainedJsonlAuditSink {
@@ -121,6 +187,32 @@ impl AuditSink for HashChainedJsonlAuditSink {
         };
         let encoded =
             serde_json::to_vec(&record).map_err(|_| audit_error("audit serialization failed"))?;
+        let line_bytes = encoded.len().saturating_add(1);
+        let encoded_bytes =
+            u64::try_from(line_bytes).map_err(|_| audit_error("audit record size is invalid"))?;
+        if line_bytes > MAX_AUDIT_LINE_BYTES {
+            return Err(audit_error("audit record exceeds size limit"));
+        }
+        if state.record_count >= MAX_AUDIT_RECORDS
+            || state.current_bytes.saturating_add(encoded_bytes) > MAX_AUDIT_FILE_BYTES
+        {
+            return Err(audit_error(
+                "audit segment limit reached; rotation is required",
+            ));
+        }
+        let observed_bytes = state
+            .writer
+            .get_ref()
+            .metadata()
+            .map_err(|_| audit_error("audit log metadata failed"))?
+            .len();
+        if observed_bytes != state.current_bytes {
+            return Err(audit_error("audit log changed outside the active writer"));
+        }
+        #[cfg(unix)]
+        if file_stamp(state.writer.get_ref())? != state.file_stamp {
+            return Err(audit_error("audit log changed outside the active writer"));
+        }
         state
             .writer
             .write_all(&encoded)
@@ -128,7 +220,23 @@ impl AuditSink for HashChainedJsonlAuditSink {
             .and_then(|()| state.writer.flush())
             .and_then(|()| state.writer.get_ref().sync_data())
             .map_err(|_| audit_error("audit durability write failed"))?;
+        let expected_bytes = state.current_bytes.saturating_add(encoded_bytes);
+        let durable_bytes = state
+            .writer
+            .get_ref()
+            .metadata()
+            .map_err(|_| audit_error("audit log metadata failed"))?
+            .len();
+        if durable_bytes != expected_bytes {
+            return Err(audit_error("audit durability size check failed"));
+        }
         state.previous_hash = record_hash;
+        state.record_count = state.record_count.saturating_add(1);
+        state.current_bytes = durable_bytes;
+        #[cfg(unix)]
+        {
+            state.file_stamp = file_stamp(state.writer.get_ref())?;
+        }
         Ok(())
     }
 }
@@ -143,41 +251,146 @@ fn compute_record_hash(previous_hash: &str, event: &AuditEvent) -> BrokerResult<
     Ok(hex::encode(hasher.finalize()))
 }
 
-fn validate_existing_chain(path: &Path) -> BrokerResult<String> {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(GENESIS_HASH.to_owned());
+fn validate_existing_chain(
+    file: &File,
+    initial_previous_hash: &str,
+) -> BrokerResult<AuditVerificationSummary> {
+    let expected_length = file
+        .metadata()
+        .map_err(|_| audit_error("audit log metadata failed"))?
+        .len();
+    #[cfg(unix)]
+    let expected_stamp = file_stamp(file)?;
+    let validation_file = file
+        .try_clone()
+        .map_err(|_| audit_error("audit log validation handle failed"))?;
+    let mut previous = initial_previous_hash.to_owned();
+    let mut record_count = 0_u64;
+    let mut first_event_at_unix_ms = None;
+    let mut last_event_at_unix_ms = None;
+    let mut reader = BufReader::new(validation_file);
+    loop {
+        let mut line = Vec::with_capacity(4096);
+        let bytes_read = Read::by_ref(&mut reader)
+            .take((MAX_AUDIT_LINE_BYTES + 1) as u64)
+            .read_until(b'\n', &mut line)
+            .map_err(|_| audit_error("audit log read failed"))?;
+        if bytes_read == 0 {
+            break;
         }
-        Err(_) => return Err(audit_error("audit log validation open failed")),
-    };
-    let mut previous = GENESIS_HASH.to_owned();
-    for line_result in BufReader::new(file).lines() {
-        let line = line_result.map_err(|_| audit_error("audit log read failed"))?;
-        if line.len() as u64 > MAX_AUDIT_LINE_BYTES {
+        if line.len() > MAX_AUDIT_LINE_BYTES {
             return Err(audit_error("audit record exceeds size limit"));
         }
-        let record: ChainedAuditEvent = serde_json::from_str(&line)
+        if line.last() != Some(&b'\n') {
+            return Err(audit_error("audit log has an incomplete final record"));
+        }
+        line.pop();
+        let record: ChainedAuditEvent = serde_json::from_slice(&line)
             .map_err(|_| audit_error("audit chain contains invalid JSON"))?;
         if record.previous_hash != previous
             || compute_record_hash(&previous, &record.event)? != record.record_hash
         {
             return Err(audit_error("audit chain validation failed"));
         }
+        record_count = record_count.saturating_add(1);
+        if record_count > MAX_AUDIT_RECORDS {
+            return Err(audit_error("audit log exceeds the record count limit"));
+        }
+        first_event_at_unix_ms.get_or_insert(record.event.started_at_unix_ms);
+        last_event_at_unix_ms = Some(
+            record
+                .event
+                .finished_at_unix_ms
+                .unwrap_or(record.event.started_at_unix_ms),
+        );
         previous = record.record_hash;
     }
-    Ok(previous)
+    if file
+        .metadata()
+        .map_err(|_| audit_error("audit log metadata failed"))?
+        .len()
+        != expected_length
+    {
+        return Err(audit_error("audit log changed during validation"));
+    }
+    #[cfg(unix)]
+    if file_stamp(file)? != expected_stamp {
+        return Err(audit_error("audit log changed during validation"));
+    }
+    Ok(AuditVerificationSummary {
+        record_count,
+        initial_previous_sha256: initial_previous_hash.to_owned(),
+        head_sha256: previous,
+        first_event_at_unix_ms,
+        last_event_at_unix_ms,
+    })
 }
 
-fn reject_unsafe_existing_file(path: &Path) -> BrokerResult<()> {
-    match path.symlink_metadata() {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            Err(audit_error("audit log is not a regular file"))
+fn open_audit_file(path: &Path, append: bool) -> BrokerResult<File> {
+    let before = match path.symlink_metadata() {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || metadata.len() > MAX_AUDIT_FILE_BYTES
+            {
+                return Err(audit_error("audit log is unsafe or exceeds the size limit"));
+            }
+            Some(metadata)
         }
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(_) => Err(audit_error("audit log metadata failed")),
+        Err(error) if append && error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return Err(audit_error("audit log metadata failed")),
+    };
+    let mut options = OpenOptions::new();
+    options.read(true).append(append).create(append);
+    #[cfg(unix)]
+    {
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
+    let file = options
+        .open(path)
+        .map_err(|_| audit_error("audit log cannot be securely opened"))?;
+    verify_private_file(&file)?;
+    let after = file
+        .metadata()
+        .map_err(|_| audit_error("audit log metadata failed"))?;
+    if !after.is_file() || after.len() > MAX_AUDIT_FILE_BYTES {
+        return Err(audit_error("audit log is unsafe or exceeds the size limit"));
+    }
+    #[cfg(unix)]
+    if before
+        .as_ref()
+        .is_some_and(|metadata| metadata.dev() != after.dev() || metadata.ino() != after.ino())
+    {
+        return Err(audit_error("audit log changed while opening"));
+    }
+    Ok(file)
+}
+
+fn validate_hash(value: &str, message: &'static str) -> BrokerResult<()> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(audit_error(message));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn file_stamp(file: &File) -> BrokerResult<FileStamp> {
+    let metadata = file
+        .metadata()
+        .map_err(|_| audit_error("audit log metadata failed"))?;
+    Ok(FileStamp {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        length: metadata.len(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+    })
 }
 
 #[cfg(unix)]
@@ -205,6 +418,9 @@ fn audit_error(message: &'static str) -> BrokerError {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::io::{Seek, SeekFrom};
+
     use super::*;
 
     fn event() -> AuditEvent {
@@ -245,6 +461,149 @@ mod tests {
         let contents = std::fs::read_to_string(&path)?;
         std::fs::write(&path, contents.replace("read_file", "write_file"))?;
         assert!(HashChainedJsonlAuditSink::open(&path).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn verification_summary_binds_external_head() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("audit.jsonl");
+        let sink = HashChainedJsonlAuditSink::open(&path)?;
+        sink.record(&event())?;
+        sink.record(&AuditEvent {
+            phase: AuditPhase::Finished,
+            finished_at_unix_ms: Some(2),
+            ..event()
+        })?;
+        drop(sink);
+
+        let summary = verify_audit_chain(&path, None, None)?;
+        assert_eq!(summary.record_count, 2);
+        assert_eq!(summary.initial_previous_sha256, GENESIS_HASH);
+        assert_eq!(summary.first_event_at_unix_ms, Some(1));
+        assert_eq!(summary.last_event_at_unix_ms, Some(2));
+        assert_eq!(summary.head_sha256.len(), 64);
+        assert_eq!(
+            verify_audit_chain(&path, None, Some(&summary.head_sha256))?,
+            summary
+        );
+        assert!(verify_audit_chain(&path, None, Some(&"f".repeat(64))).is_err());
+        assert!(verify_audit_chain(&path, None, Some("not-a-hash")).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_unknown_fields_and_incomplete_records() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("audit.jsonl");
+        let sink = HashChainedJsonlAuditSink::open(&path)?;
+        sink.record(&event())?;
+        drop(sink);
+
+        let original = fs::read_to_string(&path)?;
+        fs::write(
+            &path,
+            original.replace(
+                "\"record_hash\"",
+                "\"unprotected_extension\":true,\"record_hash\"",
+            ),
+        )?;
+        assert!(verify_audit_chain(&path, None, None).is_err());
+
+        fs::write(&path, original.trim_end_matches('\n'))?;
+        assert!(verify_audit_chain(&path, None, None).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_line_is_rejected_before_unbounded_allocation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("audit.jsonl");
+        let sink = HashChainedJsonlAuditSink::open(&path)?;
+        drop(sink);
+        fs::write(&path, vec![b'x'; MAX_AUDIT_LINE_BYTES + 1])?;
+        assert!(verify_audit_chain(&path, None, None).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn writer_refuses_oversized_record_and_external_append()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("audit.jsonl");
+        let sink = HashChainedJsonlAuditSink::open(&path)?;
+        let oversized = AuditEvent {
+            user_id: "x".repeat(MAX_AUDIT_LINE_BYTES),
+            ..event()
+        };
+        assert!(sink.record(&oversized).is_err());
+        assert_eq!(fs::metadata(&path)?.len(), 0);
+
+        let mut external = OpenOptions::new().append(true).open(&path)?;
+        external.write_all(b"external\n")?;
+        external.sync_all()?;
+        assert!(sink.record(&event()).is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_detects_same_size_external_rewrite() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("audit.jsonl");
+        let sink = HashChainedJsonlAuditSink::open(&path)?;
+        sink.record(&event())?;
+        let original_length = fs::metadata(&path)?.len();
+
+        let mut external = OpenOptions::new().write(true).open(&path)?;
+        external.seek(SeekFrom::Start(0))?;
+        external.write_all(b"X")?;
+        external.sync_all()?;
+        assert_eq!(fs::metadata(&path)?.len(), original_length);
+        assert!(sink.record(&event()).is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_verifier_rejects_symlink() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let real = directory.path().join("real.jsonl");
+        let link = directory.path().join("audit.jsonl");
+        let sink = HashChainedJsonlAuditSink::open(&real)?;
+        drop(sink);
+        std::os::unix::fs::symlink(&real, &link)?;
+        assert!(verify_audit_chain(&link, None, None).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn rotated_segment_extends_prior_head() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let first_path = directory.path().join("audit-1.jsonl");
+        let first = HashChainedJsonlAuditSink::open(&first_path)?;
+        first.record(&event())?;
+        drop(first);
+        let first_summary = verify_audit_chain(&first_path, None, None)?;
+
+        let second_path = directory.path().join("audit-2.jsonl");
+        let second = HashChainedJsonlAuditSink::open_with_initial_hash(
+            &second_path,
+            &first_summary.head_sha256,
+        )?;
+        second.record(&AuditEvent {
+            started_at_unix_ms: 3,
+            ..event()
+        })?;
+        drop(second);
+        let second_summary =
+            verify_audit_chain(&second_path, Some(&first_summary.head_sha256), None)?;
+        assert_eq!(
+            second_summary.initial_previous_sha256,
+            first_summary.head_sha256
+        );
+        assert!(verify_audit_chain(&second_path, None, None).is_err());
         Ok(())
     }
 }

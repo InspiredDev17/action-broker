@@ -103,6 +103,7 @@ fields:
 
 ```json
 {
+  "audit_initial_previous_hash": null,
   "process_inspection": {
     "enabled": false,
     "allowed_user_ids": [],
@@ -123,6 +124,12 @@ than 1,024 returned records. Both per-scope concurrency values are required,
 must be nonzero, and cannot exceed the global limit. Waiting requests observe
 cancellation and fail with a resource-limit outcome when the bounded wait
 expires; they do not consume a slot before admission.
+
+For the first audit segment, omit `audit_initial_previous_hash` to use the
+all-zero genesis. For every rotated segment, set it to the exact final
+`head_sha256` of the preceding segment. The daemon validates this linkage before
+readiness; a nonempty rotated segment fails startup when the configured initial
+head does not match its first record.
 
 ## OS profiles
 
@@ -224,7 +231,33 @@ known chain head. Periodically anchor signed/checkpointed chain heads to an
 independently protected destination; a local chain with a locally rewritable
 head is not tamper-proof against full host compromise.
 
-Rotation must carry the final hash of the previous segment into the next and
+Verify the first segment and print its bounded, secret-free summary:
+
+```text
+action-brokerd verify-audit \
+  --path /var/lib/action-broker/audit-0001.jsonl \
+  --expected-head <independently-protected-final-head>
+```
+
+Verify a rotated segment by binding both ends:
+
+```text
+action-brokerd verify-audit \
+  --path /var/lib/action-broker/audit-0002.jsonl \
+  --initial-previous-head <audit-0001-final-head> \
+  --expected-head <audit-0002-protected-final-head>
+```
+
+The verifier is read-only and does not require `serve`. It accepts only regular,
+private audit files opened without following the final symlink, limits a segment
+to 1 GiB, each record to 256 KiB, and the record count to 4,000,000. It rejects
+unknown JSON fields, missing final newlines, concurrent size changes, invalid
+hash syntax, chain discontinuity, and external-checkpoint mismatch. Rotate well
+before a bound is reached; increasing a limit is an administrative review, not
+an incident workaround.
+
+Rotation must set `audit_initial_previous_hash` to carry the final hash of the
+previous segment into the next and
 must not delete segments before retention/anchoring policy permits. Verify the
 chain:
 
