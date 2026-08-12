@@ -7,6 +7,7 @@ pub mod capability;
 pub mod command;
 pub mod error;
 pub mod filesystem;
+pub mod git;
 pub mod model;
 pub mod network;
 pub mod policy;

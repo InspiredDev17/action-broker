@@ -31,7 +31,8 @@ The foundation consists of:
   authentication;
 - a Go standard-library client for the Personal AI Platform;
 - typed request variants for every capability in the capability model;
-- local executors for filesystem actions, approved commands, and HTTP requests;
+- local executors for filesystem actions, read-only Git inspection, approved
+  commands, and HTTP requests;
 - Ed25519 approval verification using a maintained cryptographic library and a
   durable anti-replay ledger;
 - explicit filesystem root IDs backed by capability-oriented filesystem APIs;
@@ -47,6 +48,12 @@ The foundation consists of:
 Host-specific capabilities that do not yet have an explicit backend are still
 represented in the protocol, but fail closed as unsupported. Their presence in
 the schema is not a claim that they can execute.
+
+`GitRead` is local-only and implemented directly through a vendored libgit2
+library with remote transports disabled. It does not invoke `git`, hooks,
+credential helpers, shells, submodules, or remote endpoints. `GitWrite` remains
+disabled, and generic filesystem capabilities cannot access `.git` metadata as
+a substitute.
 
 ## Capabilities
 

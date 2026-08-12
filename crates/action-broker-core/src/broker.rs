@@ -13,6 +13,7 @@ use crate::capability::{
 use crate::command::{ApprovedCommandExecutor, CancellationToken};
 use crate::error::{BrokerError, BrokerResult, ErrorCode};
 use crate::filesystem::ScopedFilesystem;
+use crate::git::GitReadExecutor;
 use crate::model::{
     ACTION_BROKER_PROTOCOL_VERSION, ActionErrorResponse, ActionRequest, ActionResponse,
     ActionStatus, ExecutionTarget,
@@ -116,6 +117,7 @@ pub struct ActionBroker {
     approvals: ApprovalVerifier,
     filesystem: Arc<ScopedFilesystem>,
     commands: ApprovedCommandExecutor,
+    git: GitReadExecutor,
     http: SecureHttpClient,
     audit: Arc<dyn AuditSink>,
     security_events: Arc<dyn SecurityEventSink>,
@@ -143,11 +145,13 @@ impl ActionBroker {
         security_events: Arc<dyn SecurityEventSink>,
         limits: BrokerLimits,
     ) -> BrokerResult<Self> {
+        let git = GitReadExecutor::new(Arc::clone(&filesystem));
         Ok(Self {
             policy,
             approvals,
             filesystem,
             commands,
+            git,
             http,
             audit,
             security_events,
@@ -378,8 +382,11 @@ impl ActionBroker {
                 .http
                 .execute(input, cancellation)
                 .map(CapabilityOutput::HttpRequest),
-            CapabilityAction::GitRead(_)
-            | CapabilityAction::GitWrite(_)
+            CapabilityAction::GitRead(input) => self
+                .git
+                .execute(input, cancellation)
+                .map(CapabilityOutput::GitRead),
+            CapabilityAction::GitWrite(_)
             | CapabilityAction::BrowserAction(_)
             | CapabilityAction::ProcessInspect(_)
             | CapabilityAction::ServiceInspect(_)

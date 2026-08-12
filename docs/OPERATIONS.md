@@ -26,7 +26,7 @@ regardless of representation, production configuration must provide:
 | Replay | dedicated durable ledger path, permissions, synchronization/durability policy, retention |
 | Permissions | user/agent permission source and fail-closed refresh behavior |
 | Risk/approval | deterministic risk mapping and acceptable approval types |
-| Filesystem | explicit root ID -> opened directory mapping, operations, secret exclusions, per-root limits |
+| Filesystem | explicit root ID -> opened directory mapping, operations, secret exclusions, per-root limits; repository roots and `.git` metadata broker/root-owned and non-writable by group/other |
 | Programs | program ID -> canonical executable path + SHA-256, argv grammar, working roots, environment allowlist; digest-pinned `prlimit` + `bubblewrap` |
 | Network | schemes, hosts, ports, IP ranges, redirect limits, DNS behavior, metadata/private/localhost deny rules |
 | Resources | request/queue/concurrency, wall/CPU/memory/process/file/output limits |
@@ -132,10 +132,15 @@ Enable one narrow descriptor at a time:
    requests; and
 8. enable for a small identity/target scope before widening policy.
 
-The foundation has local filesystem, approved-command, and HTTP executor paths.
-Git, browser, process, service, container, and node variants remain disabled
-until explicit typed backends satisfy this rollout. Do not implement them by
-granting a broad command as a shortcut.
+The foundation has local filesystem, read-only Git, approved-command, and HTTP
+executor paths. Git repositories must be ordinary local worktrees whose
+bounded metadata tree passes ownership, mode, link, indirection, and local
+configuration checks. Repack unusually large loose-object stores before
+enabling them; a metadata tree above 100,000 entries fails closed.
+
+Git write, browser, process, service, container, and node variants remain
+disabled until explicit typed backends satisfy this rollout. Do not implement
+them by granting a broad command as a shortcut.
 
 ## Monitoring
 

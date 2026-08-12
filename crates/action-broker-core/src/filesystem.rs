@@ -46,6 +46,7 @@ fn default_forbidden_components() -> Vec<String> {
         ".aws",
         ".config/gcloud",
         ".docker",
+        ".git",
         ".gnupg",
         ".kube",
         ".netrc",
@@ -338,18 +339,25 @@ impl ScopedFilesystem {
     /// Opens a broker-rooted working directory for process execution. The
     /// returned absolute path remains inside the trusted executor boundary.
     pub(crate) fn working_directory_path(&self, rooted: &RootedPath) -> BrokerResult<String> {
+        self.directory_path(rooted)
+    }
+
+    /// Runs a trusted repository operation while holding the root mutation
+    /// lock. Generic filesystem capabilities cannot access `.git` directly.
+    pub(crate) fn with_repository_directory<T>(
+        &self,
+        rooted: &RootedPath,
+        operation: impl FnOnce(&Path) -> BrokerResult<T>,
+    ) -> BrokerResult<T> {
         let (root, path) = self.resolve(rooted, Access::Read)?;
-        let canonical = root.dir.canonicalize(&path).map_err(map_fs_error)?;
-        let metadata = root
-            .dir
-            .symlink_metadata(&canonical)
-            .map_err(map_fs_error)?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(path_error("working directory is not a real directory"));
-        }
-        Ok(root
-            .ambient_path
-            .join(canonical)
+        let _guard = root.mutation_lock.lock();
+        let directory = validated_directory_path(root, &path)?;
+        operation(&directory)
+    }
+
+    fn directory_path(&self, rooted: &RootedPath) -> BrokerResult<String> {
+        let (root, path) = self.resolve(rooted, Access::Read)?;
+        Ok(validated_directory_path(root, &path)?
             .to_string_lossy()
             .into_owned())
     }
@@ -438,6 +446,7 @@ fn reject_forbidden_ambient_root(path: &Path) -> BrokerResult<()> {
     let secret_components = [
         ".aws",
         ".docker",
+        ".git",
         ".gnupg",
         ".kube",
         ".ssh",
@@ -457,6 +466,22 @@ fn reject_forbidden_ambient_root(path: &Path) -> BrokerResult<()> {
         ));
     }
     Ok(())
+}
+
+fn validated_directory_path(
+    root: &FilesystemRoot,
+    path: &Path,
+) -> BrokerResult<std::path::PathBuf> {
+    reject_symlink_components(&root.dir, path)?;
+    let canonical = root.dir.canonicalize(path).map_err(map_fs_error)?;
+    let metadata = root
+        .dir
+        .symlink_metadata(&canonical)
+        .map_err(map_fs_error)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(path_error("working directory is not a real directory"));
+    }
+    Ok(root.ambient_path.join(canonical))
 }
 
 #[derive(Clone, Copy)]
@@ -837,6 +862,27 @@ mod tests {
         let result = fs.read_file(&ReadFileInput {
             path: rooted("profile/.ssh/id_ed25519"),
             maximum_bytes: 10,
+        });
+        assert!(matches!(
+            result,
+            Err(BrokerError {
+                code: ErrorCode::SecretAccess,
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn generic_filesystem_capability_cannot_read_git_metadata() -> BrokerResult<()> {
+        let directory = tempfile::tempdir().map_err(|_| BrokerError::internal())?;
+        fs::create_dir(directory.path().join(".git")).map_err(|_| BrokerError::internal())?;
+        fs::write(directory.path().join(".git/config"), b"sensitive")
+            .map_err(|_| BrokerError::internal())?;
+        let fs = filesystem(directory.path())?;
+        let result = fs.read_file(&ReadFileInput {
+            path: rooted(".git/config"),
+            maximum_bytes: 64,
         });
         assert!(matches!(
             result,

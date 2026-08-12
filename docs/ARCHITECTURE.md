@@ -95,13 +95,17 @@ The initial local executor surface is intentionally narrow:
 - filesystem operations use configured root IDs and capability-relative APIs;
 - `ExecuteApprovedCommand` launches a digest-pinned configured program through
   digest-pinned Linux `prlimit` and `bubblewrap`, with a validated argument
-  vector and cleared environment; and
+  vector and cleared environment;
 - `HttpRequest` uses a policy-bound HTTP implementation with explicit DNS and
-  redirect handling.
+  redirect handling; and
+- `GitRead` uses a local-only libgit2 backend after bounded validation of a
+  broker/root-owned `.git` tree, with metadata indirection and external Git
+  configuration disabled.
 
-Other declared capabilities require a separately reviewed backend. Until such a
-backend is configured, dispatch returns an unsupported-capability error and
-does not approximate the request through a shell or a more powerful executor.
+Other declared capabilities, including `GitWrite`, require a separately
+reviewed backend. Until such a backend is configured, dispatch returns an
+unsupported-capability error and does not approximate the request through a
+shell or a more powerful executor.
 
 ### Approval verifier and replay ledger
 

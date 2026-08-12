@@ -97,7 +97,7 @@ Every invocation still requires descriptor and policy checks.
 | `DeleteFile` | root-relative path and explicit expected pre-change state -> deletion metadata | `DESTRUCTIVE` unless a configured recovery backend proves otherwise | Local filesystem |
 | `ListDirectory` | root-relative directory, entry/metadata bounds -> bounded entries and continuation state | `READ_ONLY` | Local filesystem |
 | `ExecuteApprovedCommand` | approved program ID, argument vector, working directory, environment entries -> bounded exit/output result | Descriptor-specific; at least `PRIVILEGED_CHANGE` for consequential programs | Local process |
-| `GitRead` | repository root ID and typed read operation -> structured Git result | `READ_ONLY` | Declared; fail closed until explicit backend |
+| `GitRead` | repository root ID and typed read operation -> bounded Git result | `READ_ONLY` | Local read-only libgit2 backend |
 | `GitWrite` | repository root ID and typed mutation -> structured Git result/change evidence | `REVERSIBLE_CHANGE` or `EXTERNAL_SIDE_EFFECT` for remote writes | Declared; fail closed until explicit backend |
 | `HttpRequest` | method, URL, bounded headers/body -> status, bounded headers/body, destination trace | `EXTERNAL_SIDE_EFFECT` | Local HTTP |
 | `BrowserAction` | browser/session ID and typed navigation/input operation -> structured browser result | `EXTERNAL_SIDE_EFFECT` | Declared; fail closed until explicit backend |
@@ -110,6 +110,30 @@ Every invocation still requires descriptor and policy checks.
 ## Filesystem capabilities
 
 Filesystem inputs identify a configured root and a validated relative path.
+
+## Git read capability
+
+`GitRead` implements only `status`, `diff`, bounded `log`, full-object-ID
+`show`, and restricted revision resolution. The output field `text_base64`
+contains bounded operation text or blob bytes; `truncated` truthfully marks a
+bounded prefix. Revision syntax excludes ranges, reflog selectors, peel/path
+operators, abbreviated object IDs for `show`, and option-like values.
+
+The selected repository and its `.git` metadata must be owned by root or the
+broker UID and must not be group/other writable. The backend rejects symlinks,
+hard links, special files, linked worktrees, bare repositories, object
+alternates, configuration includes, and path-bearing/executable configuration.
+It installs only the validated local repository configuration into libgit2;
+global and system Git configuration are not consulted. It has no remote
+transport feature and does not execute hooks, filters, credential helpers,
+submodules, `git`, or a shell.
+
+`GitWrite` remains a separate signed-approval capability and has no backend.
+Generic filesystem capabilities treat `.git` as protected metadata and cannot
+be used to approximate either Git capability. Git reads hold the configured
+root's mutation lock for the complete operation so broker-mediated filesystem
+mutations cannot race metadata validation.
+
 Policy rejects absolute paths, parent traversal, platform prefix tricks,
 forbidden pseudo-filesystems, device files, secret roots, and symlink/reparse
 escapes. Both endpoints of a move are resolved independently; allowing the
@@ -154,12 +178,13 @@ remain coherent. A response redirect is new input to policy, not implicit
 permission. Unsupported proxy settings are not inherited from the broker
 environment.
 
-## Declared host-specific capabilities
+## Remaining declared host-specific capabilities
 
-Git, browser, process, service, container, and node actions must be implemented
-as typed backends. Dispatching them through `ExecuteApprovedCommand` as a
-fallback would collapse their schemas and permission boundaries, so it is
-forbidden. An implementation is enabled only after it defines:
+Git write, browser, process, service, container, and node actions must be
+implemented as typed backends. Dispatching them through
+`ExecuteApprovedCommand` as a fallback would collapse their schemas and
+permission boundaries, so it is forbidden. An implementation is enabled only
+after it defines:
 
 1. supported typed operations and output schemas;
 2. platform and version detection;

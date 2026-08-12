@@ -167,6 +167,30 @@ the OS call completes. Connection/action admission bounds the rate, and
 production deployments should also bound resolver behavior at the OS/service
 boundary. A future native asynchronous resolver may remove this limitation.
 
+## Read-only Git confinement
+
+`GitRead` is not implemented through `ExecuteApprovedCommand`. The broker opens
+only the exact root-relative worktree through libgit2 with repository discovery,
+remote transports, global/system configuration, linked worktrees, bare
+repositories, submodules, hooks, and credential helpers excluded. Before open,
+it walks at most 100,000 `.git` entries and rejects metadata not owned by root
+or the broker UID, group/other-writable objects, symlinks, hard links, special
+files, cross-filesystem metadata, alternates, external configuration includes,
+and path-bearing or executable configuration. Output is limited to 512 KiB.
+
+Generic filesystem capabilities deny `.git` paths. The read backend holds the
+selected root's mutation lock from path resolution through output generation,
+preventing another broker filesystem action from swapping validated metadata.
+
+Cancellation and the ten-second deadline are checked before repository access,
+during metadata validation, and during output-producing iterations. Some
+individual synchronous libgit2 calls, notably repository open and initial
+status calculation, do not provide a preemption callback; a hostile or damaged
+repository could therefore occupy its current worker after the broker deadline
+until that call returns. Keep repository metadata broker-controlled, bound
+repository size, monitor saturation, and use a separately contained worker if
+strict preemption is required by the deployment threat model.
+
 ## Operating-system support
 
 ### Linux

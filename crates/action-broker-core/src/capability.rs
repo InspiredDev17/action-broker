@@ -867,7 +867,7 @@ fn descriptor_policy(kind: CapabilityKind) -> DescriptorPolicy {
             approval: approval(PolicyOnly, &[]),
             filesystem: filesystem(FilesystemAccess::RepositoryRead),
             network: network(NetworkAccess::None),
-            timeout: timeout(5_000, 30_000),
+            timeout: timeout(10_000, 10_000),
             resources: resources(4, 4 * 1024 * 1024),
             audit: audit(false, false),
             reversibility: Reversibility::NotReversible,
