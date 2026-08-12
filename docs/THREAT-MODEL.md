@@ -79,7 +79,7 @@ corresponding security property.
 | Cancellation ambiguity | authenticated scoped cancellation, process-group/worker termination, audit side effects | Cancellation cannot retract external effects or guarantee child cleanup without OS containment |
 | Audit deletion/reordering or parser ambiguity | strict bounded JSONL, same-file no-symlink validation, hash chain, explicit cross-segment initial head, external final-head comparison | A local attacker controlling both log and every unanchored checkpoint can rewrite history |
 | Secret leakage in telemetry | structured allowlisted audit/event fields, redaction, output digest rather than full output | Novel secret formats can evade redaction; avoid logging payloads by design |
-| Agent Green disabled/suppressed | no request toggle, mandatory local spool, readiness failure when required spool unavailable | A fully compromised host can tamper with both broker and spool; remote receipt is separately monitored |
+| Agent Green disabled, suppressed, or storage-flooded | no request toggle, mandatory durable spool, strict bounded startup validation, configured capacity/headroom, active-file modification detection | A fully compromised host can tamper with both broker and spool; remote receipt and stop/archive/restart rotation are separately operated |
 | Remote node semantic drift | target bound into approval; same schemas; node repeats policy; version/attestation gates | Future Node Runtime is not implemented by the local foundation and remote execution remains denied |
 
 ## Security events

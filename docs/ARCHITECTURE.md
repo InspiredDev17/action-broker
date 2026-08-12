@@ -140,6 +140,13 @@ Agent Green spool. The request and capability schemas contain no switch that can
 disable this path. Local spooling is a durable handoff, not proof that a remote
 Agent Green collector received the event.
 
+The spool is strict bounded JSONL. Trusted configuration sets a capacity between
+1 MiB and 1 GiB; startup validates every existing record and requires 64 KiB of
+headroom. Unknown fields, unsupported versions, oversized/incomplete records,
+unsafe files, capacity exhaustion, and external modification fail closed. The
+collector may read the file but cannot truncate or rewrite it while the broker
+is active.
+
 ## Trust boundaries
 
 | Boundary | Untrusted side | Trusted side | Required controls |

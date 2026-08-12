@@ -42,7 +42,8 @@ The foundation consists of:
 - Linux `bubblewrap` isolation wrapped by policy-pinned `prlimit`, subprocess
   environment clearing, deadlines, and bounded output, without shell expansion;
 - an append-only, hash-chained audit log and a mandatory local Agent Green
-  security-event spool; and
+  security-event spool with strict startup validation, explicit capacity, and
+  external-modification detection; and
 - an `ExecutionTarget` boundary that preserves capability semantics for a future
   remote Node Runtime.
 

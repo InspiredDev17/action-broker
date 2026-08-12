@@ -94,6 +94,7 @@ struct DaemonConfig {
     #[serde(default)]
     audit_initial_previous_hash: Option<String>,
     agent_green_event_spool_path: PathBuf,
+    agent_green_event_spool_maximum_bytes: u64,
     approval_keys: Vec<ApprovalKeyConfig>,
     approval_verifier: ApprovalVerifierWireConfig,
     policy: PolicyConfig,
@@ -296,8 +297,9 @@ fn build_broker(config: &DaemonConfig) -> Result<ActionBroker, BrokerError> {
         }
         None => HashChainedJsonlAuditSink::open(&config.audit_log_path)?,
     });
-    let security_events = Arc::new(JsonlSecurityEventSink::open(
+    let security_events = Arc::new(JsonlSecurityEventSink::open_with_maximum_bytes(
         &config.agent_green_event_spool_path,
+        config.agent_green_event_spool_maximum_bytes,
     )?);
     ActionBroker::new(
         policy,

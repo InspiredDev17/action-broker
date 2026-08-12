@@ -32,7 +32,7 @@ regardless of representation, production configuration must provide:
 | Process inspection | explicit enable flag, non-root numeric UID allowlist, bounded maximum entries; disabled by default |
 | Resources | request/queue/concurrency, wall/CPU/memory/process/file/output limits |
 | Audit | protected append-only log, chain genesis/head state, rotation, external anchor destination |
-| Agent Green | mandatory protected local spool, capacity/retention, collector ownership and acknowledgement monitoring |
+| Agent Green | mandatory protected local spool, explicit 1 MiB-1 GiB capacity, retention, read-only collector access, acknowledgement monitoring |
 | OS profile | detected/required isolation controls and fail-closed capability gates |
 
 Never store approval signing keys in the broker configuration. Avoid secrets in
@@ -104,6 +104,7 @@ fields:
 ```json
 {
   "audit_initial_previous_hash": null,
+  "agent_green_event_spool_maximum_bytes": 67108864,
   "process_inspection": {
     "enabled": false,
     "allowed_user_ids": [],
@@ -272,14 +273,24 @@ Never “temporarily” disable audit to recover space while continuing executio
 ## Agent Green spool operations
 
 The local spool is mandatory. Action Broker cannot disable it, and action
-requests contain no suppression field. The spool must persist records safely,
-bound individual and total sizes, expose backpressure/health, and permit the
-Agent Green collector to acknowledge delivery without letting it rewrite
-unrelated entries.
+requests contain no suppression field. Configuration must set
+`agent_green_event_spool_maximum_bytes` from 1 MiB through 1 GiB. Individual
+records are limited to 64 KiB. Startup strictly validates every JSONL record,
+rejects unknown fields and unsupported versions, and requires at least 64 KiB
+of remaining headroom. The writer checks capacity and file identity/change
+timestamps around durable appends; any external append, rewrite, truncation, or
+replacement causes subsequent emission to fail closed.
 
 Remote collector success is not implied by a successful local append. Monitor
-the oldest unacknowledged event. If the spool reaches its safe capacity or
-cannot durably append a required event, the relevant action path fails closed.
+the oldest unacknowledged event and remaining bytes. The collector may tail a
+read-only descriptor and store acknowledgements outside the spool, but it must
+not modify the JSONL file. Live truncation and rotation are intentionally not
+implemented. To reclaim an acknowledged segment, stop the broker, preserve and
+verify/ship the file under incident-retention policy, create a new owner-only
+empty spool at the configured path, and complete startup/readiness checks. If
+the spool reaches capacity or cannot durably append a required event, the
+relevant action path fails closed; do not delete records while continuing
+execution.
 
 ## Backup and restore
 
