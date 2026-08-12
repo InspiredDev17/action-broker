@@ -75,6 +75,7 @@ corresponding security property.
 | Privilege escalation | distinct unprivileged broker UID, no helper frontend, EUID check, immutable digest-pinned executables, setuid/setgid rejection | Capability sets, supplementary groups, and child post-exec privilege are not yet inspected; keep profiles disabled where required |
 | Concurrent lost update | expected pre-change digest/object identity, per-resource coordination, atomic ledger writes | External actors outside the broker can still race; operations that cannot bind state must fail or report conditional semantics |
 | Git metadata indirection | exact rooted worktree, broker/root-owned bounded metadata walk, no links/alternates/includes, local-only isolated libgit2 configuration | Synchronous library calls are not forcibly preemptible; unusually large or corrupt repositories require a contained worker or must remain disabled |
+| Process metadata disclosure or PID reuse | disabled-by-default non-root UID allowlist, bounded procfs reads, start-time and identity recheck, basename-only executable, no `cmdline` or `environ` access | Linux procfs visibility and mount policy vary; production evidence is host-specific |
 | Cancellation ambiguity | authenticated scoped cancellation, process-group/worker termination, audit side effects | Cancellation cannot retract external effects or guarantee child cleanup without OS containment |
 | Audit deletion/reordering | append-only hash chain, restricted storage, external chain-head anchoring | A local attacker controlling both log and unanchored chain head can rewrite history |
 | Secret leakage in telemetry | structured allowlisted audit/event fields, redaction, output digest rather than full output | Novel secret formats can evade redaction; avoid logging payloads by design |
@@ -140,8 +141,11 @@ tests on the actual OS/filesystem/deployment profile.
 Action Broker protects bounded availability, not unlimited service. It caps
 open connections at 128, bounds frames and socket reads, and limits active
 actions, DNS/redirect work, subprocess output, and audit/event record size.
-Per-principal and per-capability queues are not implemented; deployments that
-need those controls must add them before widening the peer set.
+The broker enforces bounded global, per-principal, and per-capability in-flight
+counts. Admission waits are bounded and cancellation-aware. It does not provide
+weighted fairness, persistent queues, or per-principal scheduling guarantees;
+deployments that require those properties must keep the peer set narrow or add
+an external admission tier without bypassing broker authorization.
 
 If audit, replay, or mandatory Agent Green storage is unavailable, consequential
 execution stops. This permits an availability attack, but continuing without
@@ -153,5 +157,5 @@ The foundation does not claim protection from a compromised kernel or root,
 formal noninterference, perfect secret detection, universal rollback, equivalent
 Linux/macOS isolation, safe arbitrary interpreters, or delivery confirmation to
 a remote Agent Green system. It also does not yet implement remote Node Runtime
-execution or host-specific Git/browser/process/service/container backends merely
+execution or host-specific Git-write/browser/service/container backends merely
 because their typed variants exist.

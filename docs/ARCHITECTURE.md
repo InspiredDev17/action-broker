@@ -44,6 +44,7 @@ UNTRUSTED                                      TRUSTED CONTROL PLANE
            +-- capability filesystem roots
            +-- approved subprocess
            +-- policy-bound HTTP client
+           +-- policy-scoped Linux process metadata
            |
            v
   operating-system controls / remote destinations
@@ -97,15 +98,18 @@ The initial local executor surface is intentionally narrow:
   digest-pinned Linux `prlimit` and `bubblewrap`, with a validated argument
   vector and cleared environment;
 - `HttpRequest` uses a policy-bound HTTP implementation with explicit DNS and
-  redirect handling; and
+  redirect handling;
 - `GitRead` uses a local-only libgit2 backend after bounded validation of a
   broker/root-owned `.git` tree, with metadata indirection and external Git
-  configuration disabled.
+  configuration disabled; and
+- `ProcessInspect` reads bounded Linux procfs metadata for an exact trusted UID
+  allowlist without launching `ps`, reading command lines, or reading process
+  environments.
 
-Other declared capabilities, including `GitWrite`, require a separately
-reviewed backend. Until such a backend is configured, dispatch returns an
-unsupported-capability error and does not approximate the request through a
-shell or a more powerful executor.
+Other declared capabilities, including `GitWrite` and service control, require
+a separately reviewed backend. Until such a backend is configured, dispatch
+returns an unsupported-capability error and does not approximate the request
+through a shell or a more powerful executor.
 
 ### Approval verifier and replay ledger
 

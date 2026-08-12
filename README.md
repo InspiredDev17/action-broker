@@ -32,7 +32,7 @@ The foundation consists of:
 - a Go standard-library client for the Personal AI Platform;
 - typed request variants for every capability in the capability model;
 - local executors for filesystem actions, read-only Git inspection, approved
-  commands, and HTTP requests;
+  commands, HTTP requests, and policy-scoped Linux process inspection;
 - Ed25519 approval verification using a maintained cryptographic library and a
   durable anti-replay ledger, with per-key activation, retirement, and hard
   revocation enforcement;
@@ -49,6 +49,12 @@ The foundation consists of:
 Host-specific capabilities that do not yet have an explicit backend are still
 represented in the protocol, but fail closed as unsupported. Their presence in
 the schema is not a claim that they can execute.
+
+`ProcessInspect` is disabled by default. On Linux it can be enabled only with a
+non-root UID allowlist and a bounded result limit. It reads kernel-owned
+`/proc` status, start-time, and executable-link metadata in process, rechecks
+identity to detect PID reuse, returns only the executable basename, and never
+opens process command lines or environments.
 
 `GitRead` is local-only and implemented directly through a vendored libgit2
 library with remote transports disabled. It does not invoke `git`, hooks,
@@ -80,7 +86,9 @@ Action Broker is designed to fail closed:
   host filesystem;
 - HTTP policy checks the scheme, host, resolved IPs, port, redirects, localhost,
   private ranges, and metadata endpoints;
-- child processes do not inherit the broker environment or its secrets; and
+- child processes do not inherit the broker environment or its secrets;
+- global, per-principal, and per-capability admission bounds prevent one peer or
+  one capability from consuming every execution slot; and
 - security events cannot be disabled by an action request.
 
 The Personal AI Platform and Action Broker must run under different

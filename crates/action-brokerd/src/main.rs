@@ -28,6 +28,7 @@ use action_broker_core::model::{
 use action_broker_core::model::{ActionRequest, ActionResponse};
 use action_broker_core::network::{NetworkPolicyConfig, SecureHttpClient};
 use action_broker_core::policy::{DeterministicPolicy, PolicyConfig};
+use action_broker_core::process::{ProcessInspectExecutor, ProcessInspectPolicyConfig};
 use action_broker_core::security_event::JsonlSecurityEventSink;
 use clap::{Parser, Subcommand};
 use ed25519_dalek::VerifyingKey;
@@ -86,6 +87,8 @@ struct DaemonConfig {
     filesystem: FilesystemPolicyConfig,
     commands: CommandPolicyConfig,
     network: NetworkPolicyConfig,
+    #[serde(default)]
+    process_inspection: ProcessInspectPolicyConfig,
     broker_limits: BrokerLimitsWireConfig,
 }
 
@@ -119,6 +122,8 @@ struct ApprovalVerifierWireConfig {
 #[serde(deny_unknown_fields)]
 struct BrokerLimitsWireConfig {
     maximum_concurrent_actions: usize,
+    maximum_concurrent_actions_per_principal: usize,
+    maximum_concurrent_actions_per_capability: usize,
     concurrency_wait_milliseconds: u64,
 }
 
@@ -249,6 +254,8 @@ fn build_broker(config: &DaemonConfig) -> Result<ActionBroker, BrokerError> {
     let commands =
         ApprovedCommandExecutor::from_config(Arc::clone(&filesystem), config.commands.clone())?;
     let http = SecureHttpClient::new(config.network.clone())?;
+    let process_inspection =
+        ProcessInspectExecutor::from_config(config.process_inspection.clone())?;
     let audit = Arc::new(HashChainedJsonlAuditSink::open(&config.audit_log_path)?);
     let security_events = Arc::new(JsonlSecurityEventSink::open(
         &config.agent_green_event_spool_path,
@@ -259,10 +266,17 @@ fn build_broker(config: &DaemonConfig) -> Result<ActionBroker, BrokerError> {
         filesystem,
         commands,
         http,
+        process_inspection,
         audit,
         security_events,
         BrokerLimits {
             maximum_concurrent_actions: config.broker_limits.maximum_concurrent_actions,
+            maximum_concurrent_actions_per_principal: config
+                .broker_limits
+                .maximum_concurrent_actions_per_principal,
+            maximum_concurrent_actions_per_capability: config
+                .broker_limits
+                .maximum_concurrent_actions_per_capability,
             concurrency_wait_milliseconds: config.broker_limits.concurrency_wait_milliseconds,
         },
     )
@@ -660,6 +674,22 @@ mod tests {
         assert!(decode_strict::<ApprovalKeyConfig>(missing_activation).is_err());
         let unknown = br#"{"key_id":"key-1","public_key_path":"/etc/action-broker/key.pub","active_from_unix_seconds":1700000000,"bypass":true}"#;
         assert!(decode_strict::<ApprovalKeyConfig>(unknown).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn broker_admission_limits_are_required_and_strict() -> Result<(), Box<dyn Error>> {
+        let valid = br#"{"maximum_concurrent_actions":8,"maximum_concurrent_actions_per_principal":4,"maximum_concurrent_actions_per_capability":4,"concurrency_wait_milliseconds":1000}"#;
+        let decoded = decode_strict::<BrokerLimitsWireConfig>(valid)?;
+        assert_eq!(decoded.maximum_concurrent_actions, 8);
+        assert_eq!(decoded.maximum_concurrent_actions_per_principal, 4);
+        assert_eq!(decoded.maximum_concurrent_actions_per_capability, 4);
+
+        let missing_scope =
+            br#"{"maximum_concurrent_actions":8,"concurrency_wait_milliseconds":1000}"#;
+        assert!(decode_strict::<BrokerLimitsWireConfig>(missing_scope).is_err());
+        let bypass = br#"{"maximum_concurrent_actions":8,"maximum_concurrent_actions_per_principal":4,"maximum_concurrent_actions_per_capability":4,"concurrency_wait_milliseconds":1000,"bypass":true}"#;
+        assert!(decode_strict::<BrokerLimitsWireConfig>(bypass).is_err());
         Ok(())
     }
 

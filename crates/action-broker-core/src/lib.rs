@@ -11,4 +11,5 @@ pub mod git;
 pub mod model;
 pub mod network;
 pub mod policy;
+pub mod process;
 pub mod security_event;

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -20,11 +21,14 @@ use crate::model::{
 };
 use crate::network::SecureHttpClient;
 use crate::policy::DeterministicPolicy;
+use crate::process::ProcessInspectExecutor;
 use crate::security_event::{SecurityEvent, SecurityEventKind, SecurityEventSink};
 
 #[derive(Debug, Clone, Copy)]
 pub struct BrokerLimits {
     pub maximum_concurrent_actions: usize,
+    pub maximum_concurrent_actions_per_principal: usize,
+    pub maximum_concurrent_actions_per_capability: usize,
     pub concurrency_wait_milliseconds: u64,
 }
 
@@ -32,6 +36,8 @@ impl Default for BrokerLimits {
     fn default() -> Self {
         Self {
             maximum_concurrent_actions: 8,
+            maximum_concurrent_actions_per_principal: 4,
+            maximum_concurrent_actions_per_capability: 4,
             concurrency_wait_milliseconds: 1_000,
         }
     }
@@ -39,22 +45,41 @@ impl Default for BrokerLimits {
 
 struct ConcurrencyState {
     in_flight: usize,
+    by_principal: BTreeMap<(String, String), usize>,
+    by_capability: BTreeMap<crate::capability::CapabilityKind, usize>,
 }
 
 struct ConcurrencyGate {
     state: Mutex<ConcurrencyState>,
     available: Condvar,
     maximum: usize,
+    maximum_per_principal: usize,
+    maximum_per_capability: usize,
     wait: Duration,
 }
 
-struct ConcurrencyPermit<'a>(&'a ConcurrencyGate);
+struct ConcurrencyPermit<'a> {
+    gate: &'a ConcurrencyGate,
+    principal: (String, String),
+    capability: crate::capability::CapabilityKind,
+}
 
 impl Drop for ConcurrencyPermit<'_> {
     fn drop(&mut self) {
-        if let Ok(mut state) = self.0.state.lock() {
+        if let Ok(mut state) = self.gate.state.lock() {
             state.in_flight = state.in_flight.saturating_sub(1);
-            self.0.available.notify_one();
+            decrement_count(&mut state.by_principal, &self.principal);
+            decrement_count(&mut state.by_capability, &self.capability);
+            self.gate.available.notify_all();
+        }
+    }
+}
+
+fn decrement_count<K: Ord>(counts: &mut BTreeMap<K, usize>, key: &K) {
+    if let Some(count) = counts.get_mut(key) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            counts.remove(key);
         }
     }
 }
@@ -63,6 +88,10 @@ impl ConcurrencyGate {
     fn new(limits: BrokerLimits) -> BrokerResult<Self> {
         if limits.maximum_concurrent_actions == 0
             || limits.maximum_concurrent_actions > 256
+            || limits.maximum_concurrent_actions_per_principal == 0
+            || limits.maximum_concurrent_actions_per_principal > limits.maximum_concurrent_actions
+            || limits.maximum_concurrent_actions_per_capability == 0
+            || limits.maximum_concurrent_actions_per_capability > limits.maximum_concurrent_actions
             || limits.concurrency_wait_milliseconds == 0
             || limits.concurrency_wait_milliseconds > 30_000
         {
@@ -71,20 +100,38 @@ impl ConcurrencyGate {
             ));
         }
         Ok(Self {
-            state: Mutex::new(ConcurrencyState { in_flight: 0 }),
+            state: Mutex::new(ConcurrencyState {
+                in_flight: 0,
+                by_principal: BTreeMap::new(),
+                by_capability: BTreeMap::new(),
+            }),
             available: Condvar::new(),
             maximum: limits.maximum_concurrent_actions,
+            maximum_per_principal: limits.maximum_concurrent_actions_per_principal,
+            maximum_per_capability: limits.maximum_concurrent_actions_per_capability,
             wait: Duration::from_millis(limits.concurrency_wait_milliseconds),
         })
     }
 
-    fn acquire(&self) -> BrokerResult<ConcurrencyPermit<'_>> {
+    fn acquire(
+        &self,
+        requester: &AuthenticatedRequester,
+        capability: crate::capability::CapabilityKind,
+        cancellation: &CancellationToken,
+    ) -> BrokerResult<ConcurrencyPermit<'_>> {
+        let principal = (requester.user_id.clone(), requester.agent_id.clone());
         let deadline = Instant::now() + self.wait;
         let mut state = self
             .state
             .lock()
             .map_err(|_| BrokerError::new(ErrorCode::Internal, "concurrency lock failed"))?;
-        while state.in_flight >= self.maximum {
+        while self.at_capacity(&state, &principal, capability) {
+            if cancellation.is_cancelled() {
+                return Err(BrokerError::new(
+                    ErrorCode::Cancelled,
+                    "action was cancelled while waiting for broker capacity",
+                ));
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(BrokerError::new(
@@ -94,10 +141,13 @@ impl ConcurrencyGate {
             }
             let (next, timeout) = self
                 .available
-                .wait_timeout(state, remaining)
+                .wait_timeout(state, remaining.min(Duration::from_millis(50)))
                 .map_err(|_| BrokerError::new(ErrorCode::Internal, "concurrency wait failed"))?;
             state = next;
-            if timeout.timed_out() && state.in_flight >= self.maximum {
+            if timeout.timed_out()
+                && Instant::now() >= deadline
+                && self.at_capacity(&state, &principal, capability)
+            {
                 return Err(BrokerError::new(
                     ErrorCode::ResourceLimit,
                     "broker concurrency limit reached",
@@ -105,7 +155,25 @@ impl ConcurrencyGate {
             }
         }
         state.in_flight = state.in_flight.saturating_add(1);
-        Ok(ConcurrencyPermit(self))
+        *state.by_principal.entry(principal.clone()).or_default() += 1;
+        *state.by_capability.entry(capability).or_default() += 1;
+        Ok(ConcurrencyPermit {
+            gate: self,
+            principal,
+            capability,
+        })
+    }
+
+    fn at_capacity(
+        &self,
+        state: &ConcurrencyState,
+        principal: &(String, String),
+        capability: crate::capability::CapabilityKind,
+    ) -> bool {
+        state.in_flight >= self.maximum
+            || state.by_principal.get(principal).copied().unwrap_or(0) >= self.maximum_per_principal
+            || state.by_capability.get(&capability).copied().unwrap_or(0)
+                >= self.maximum_per_capability
     }
 }
 
@@ -118,6 +186,7 @@ pub struct ActionBroker {
     filesystem: Arc<ScopedFilesystem>,
     commands: ApprovedCommandExecutor,
     git: GitReadExecutor,
+    process_inspection: ProcessInspectExecutor,
     http: SecureHttpClient,
     audit: Arc<dyn AuditSink>,
     security_events: Arc<dyn SecurityEventSink>,
@@ -141,6 +210,7 @@ impl ActionBroker {
         filesystem: Arc<ScopedFilesystem>,
         commands: ApprovedCommandExecutor,
         http: SecureHttpClient,
+        process_inspection: ProcessInspectExecutor,
         audit: Arc<dyn AuditSink>,
         security_events: Arc<dyn SecurityEventSink>,
         limits: BrokerLimits,
@@ -152,6 +222,7 @@ impl ActionBroker {
             filesystem,
             commands,
             git,
+            process_inspection,
             http,
             audit,
             security_events,
@@ -236,7 +307,11 @@ impl ActionBroker {
             self.emit_for_error(request, &error)?;
             return Err(error);
         }
-        let _permit = match self.concurrency.acquire() {
+        let _permit = match self.concurrency.acquire(
+            authenticated_requester,
+            request.capability(),
+            cancellation,
+        ) {
             Ok(permit) => permit,
             Err(error) => {
                 self.emit_for_error(request, &error)?;
@@ -386,9 +461,12 @@ impl ActionBroker {
                 .git
                 .execute(input, cancellation)
                 .map(CapabilityOutput::GitRead),
+            CapabilityAction::ProcessInspect(input) => self
+                .process_inspection
+                .execute(input, cancellation)
+                .map(CapabilityOutput::ProcessInspect),
             CapabilityAction::GitWrite(_)
             | CapabilityAction::BrowserAction(_)
-            | CapabilityAction::ProcessInspect(_)
             | CapabilityAction::ServiceInspect(_)
             | CapabilityAction::ServiceControl(_)
             | CapabilityAction::ContainerAction(_)
@@ -718,6 +796,22 @@ mod tests {
 
     struct FailingSecurityEventSink;
 
+    fn authenticated(user_id: &str, agent_id: &str) -> AuthenticatedRequester {
+        AuthenticatedRequester {
+            user_id: user_id.to_owned(),
+            agent_id: agent_id.to_owned(),
+        }
+    }
+
+    fn test_limits(global: usize, principal: usize, capability: usize) -> BrokerLimits {
+        BrokerLimits {
+            maximum_concurrent_actions: global,
+            maximum_concurrent_actions_per_principal: principal,
+            maximum_concurrent_actions_per_capability: capability,
+            concurrency_wait_milliseconds: 10,
+        }
+    }
+
     impl SecurityEventSink for FailingSecurityEventSink {
         fn emit(&self, _event: &SecurityEvent) -> BrokerResult<()> {
             Err(BrokerError::new(
@@ -729,26 +823,58 @@ mod tests {
 
     #[test]
     fn concurrency_gate_releases_permit() -> BrokerResult<()> {
-        let gate = ConcurrencyGate::new(BrokerLimits {
-            maximum_concurrent_actions: 1,
-            concurrency_wait_milliseconds: 10,
-        })?;
-        let permit = gate.acquire()?;
-        assert!(gate.acquire().is_err());
+        let gate = ConcurrencyGate::new(test_limits(1, 1, 1))?;
+        let requester = authenticated("user", "agent");
+        let cancellation = CancellationToken::new();
+        let permit = gate.acquire(
+            &requester,
+            crate::capability::CapabilityKind::ReadFile,
+            &cancellation,
+        )?;
+        assert!(
+            gate.acquire(
+                &requester,
+                crate::capability::CapabilityKind::ReadFile,
+                &cancellation,
+            )
+            .is_err()
+        );
         drop(permit);
-        assert!(gate.acquire().is_ok());
+        assert!(
+            gate.acquire(
+                &requester,
+                crate::capability::CapabilityKind::ReadFile,
+                &cancellation,
+            )
+            .is_ok()
+        );
         Ok(())
     }
 
     #[test]
     fn concurrency_gate_rejects_excess_parallel_action() -> BrokerResult<()> {
-        let gate = Arc::new(ConcurrencyGate::new(BrokerLimits {
-            maximum_concurrent_actions: 1,
-            concurrency_wait_milliseconds: 20,
-        })?);
-        let first = gate.acquire()?;
+        let mut limits = test_limits(1, 1, 1);
+        limits.concurrency_wait_milliseconds = 20;
+        let gate = Arc::new(ConcurrencyGate::new(limits)?);
+        let requester = authenticated("user", "agent");
+        let cancellation = CancellationToken::new();
+        let first = gate.acquire(
+            &requester,
+            crate::capability::CapabilityKind::ReadFile,
+            &cancellation,
+        )?;
         let competing_gate = Arc::clone(&gate);
-        let competing = thread::spawn(move || competing_gate.acquire().map(drop));
+        let competing_requester = requester.clone();
+        let competing = thread::spawn(move || {
+            let cancellation = CancellationToken::new();
+            competing_gate
+                .acquire(
+                    &competing_requester,
+                    crate::capability::CapabilityKind::ReadFile,
+                    &cancellation,
+                )
+                .map(drop)
+        });
         let result = competing
             .join()
             .map_err(|_| BrokerError::new(ErrorCode::Internal, "test worker failed"))?;
@@ -761,7 +887,89 @@ mod tests {
             })
         ));
         drop(first);
-        assert!(gate.acquire().is_ok());
+        assert!(
+            gate.acquire(
+                &requester,
+                crate::capability::CapabilityKind::ReadFile,
+                &cancellation,
+            )
+            .is_ok()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn concurrency_gate_isolates_principals_and_capabilities() -> BrokerResult<()> {
+        let gate = ConcurrencyGate::new(test_limits(4, 1, 2))?;
+        let first_principal = authenticated("user-1", "agent");
+        let second_principal = authenticated("user-2", "agent");
+        let first = gate.acquire(
+            &first_principal,
+            crate::capability::CapabilityKind::ReadFile,
+            &CancellationToken::new(),
+        )?;
+
+        assert!(
+            gate.acquire(
+                &first_principal,
+                crate::capability::CapabilityKind::HttpRequest,
+                &CancellationToken::new(),
+            )
+            .is_err()
+        );
+        let second = gate.acquire(
+            &second_principal,
+            crate::capability::CapabilityKind::ReadFile,
+            &CancellationToken::new(),
+        )?;
+        let third_principal = authenticated("user-3", "agent");
+        assert!(
+            gate.acquire(
+                &third_principal,
+                crate::capability::CapabilityKind::ReadFile,
+                &CancellationToken::new(),
+            )
+            .is_err()
+        );
+
+        drop((first, second));
+        assert!(
+            gate.acquire(
+                &first_principal,
+                crate::capability::CapabilityKind::HttpRequest,
+                &CancellationToken::new(),
+            )
+            .is_ok()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn concurrency_wait_observes_cancellation() -> BrokerResult<()> {
+        let mut limits = test_limits(1, 1, 1);
+        limits.concurrency_wait_milliseconds = 1_000;
+        let gate = ConcurrencyGate::new(limits)?;
+        let requester = authenticated("user", "agent");
+        let first = gate.acquire(
+            &requester,
+            crate::capability::CapabilityKind::ReadFile,
+            &CancellationToken::new(),
+        )?;
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let result = gate.acquire(
+            &requester,
+            crate::capability::CapabilityKind::ReadFile,
+            &cancellation,
+        );
+        assert!(matches!(
+            result,
+            Err(BrokerError {
+                code: ErrorCode::Cancelled,
+                ..
+            })
+        ));
+        drop(first);
         Ok(())
     }
 

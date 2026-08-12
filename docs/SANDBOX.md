@@ -191,6 +191,23 @@ until that call returns. Keep repository metadata broker-controlled, bound
 repository size, monitor saturation, and use a separately contained worker if
 strict preemption is required by the deployment threat model.
 
+## Process inspection
+
+`ProcessInspect` is an in-process, read-only Linux procfs backend. It is disabled
+unless trusted configuration supplies an explicit non-root UID allowlist and a
+maximum result count. The request selects only `list` with a lower bound or one
+numeric PID; it cannot select a procfs path, UID, field, command, or environment.
+
+Each record is assembled from bounded `status` and `stat` reads plus the
+kernel-owned `exe` link. Metadata files must not be symlinks. PID, UID, parent,
+and start time are read again after the executable basename so process exit or
+PID reuse fails or omits the record. The backend does not read `cmdline`,
+`environ`, `mem`, `fd`, `root`, namespace handles, or full executable paths.
+It launches no subprocess and therefore does not inherit a command environment
+or introduce a shell boundary. Actual procfs visibility and `hidepid` settings
+remain deployment-profile properties and must be tested on Linux. Inspection
+also has a two-second wall deadline and cancellation checks between reads.
+
 ## Operating-system support
 
 ### Linux

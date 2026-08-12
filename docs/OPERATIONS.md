@@ -29,6 +29,7 @@ regardless of representation, production configuration must provide:
 | Filesystem | explicit root ID -> opened directory mapping, operations, secret exclusions, per-root limits; repository roots and `.git` metadata broker/root-owned and non-writable by group/other |
 | Programs | program ID -> canonical executable path + SHA-256, argv grammar, working roots, environment allowlist; digest-pinned `prlimit` + `bubblewrap` |
 | Network | schemes, hosts, ports, IP ranges, redirect limits, DNS behavior, metadata/private/localhost deny rules |
+| Process inspection | explicit enable flag, non-root numeric UID allowlist, bounded maximum entries; disabled by default |
 | Resources | request/queue/concurrency, wall/CPU/memory/process/file/output limits |
 | Audit | protected append-only log, chain genesis/head state, rotation, external anchor destination |
 | Agent Green | mandatory protected local spool, capacity/retention, collector ownership and acknowledgement monitoring |
@@ -97,6 +98,32 @@ When a mandatory subsystem later fails, consequential actions stop until it
 recovers. Read-only actions may continue only if explicit policy allows and
 their required audit/event guarantees remain intact.
 
+The strict JSON configuration includes these admission and process-inspection
+fields:
+
+```json
+{
+  "process_inspection": {
+    "enabled": false,
+    "allowed_user_ids": [],
+    "maximum_entries": 256
+  },
+  "broker_limits": {
+    "maximum_concurrent_actions": 8,
+    "maximum_concurrent_actions_per_principal": 4,
+    "maximum_concurrent_actions_per_capability": 4,
+    "concurrency_wait_milliseconds": 1000
+  }
+}
+```
+
+`process_inspection` may be omitted only to select the same disabled default.
+Enabling it requires at least one UID, forbids UID 0, and never authorizes more
+than 1,024 returned records. Both per-scope concurrency values are required,
+must be nonzero, and cannot exceed the global limit. Waiting requests observe
+cancellation and fail with a resource-limit outcome when the bounded wait
+expires; they do not consume a slot before admission.
+
 ## OS profiles
 
 ### Linux
@@ -133,13 +160,14 @@ Enable one narrow descriptor at a time:
    requests; and
 8. enable for a small identity/target scope before widening policy.
 
-The foundation has local filesystem, read-only Git, approved-command, and HTTP
-executor paths. Git repositories must be ordinary local worktrees whose
+The foundation has local filesystem, read-only Git, approved-command, HTTP,
+and opt-in Linux process-inspection executor paths. Git repositories must be
+ordinary local worktrees whose
 bounded metadata tree passes ownership, mode, link, indirection, and local
 configuration checks. Repack unusually large loose-object stores before
 enabling them; a metadata tree above 100,000 entries fails closed.
 
-Git write, browser, process, service, container, and node variants remain
+Git write, browser, service, container, and node variants remain
 disabled until explicit typed backends satisfy this rollout. Do not implement
 them by granting a broad command as a shortcut.
 
@@ -155,8 +183,8 @@ Monitor at least:
   rejected/corrupt records;
 - path escape, secret access, forbidden executable/destination, sandbox failure,
   unexpected elevation, and resource-abuse events;
-- queue depth, active actions, timeouts, cancellations, output truncation, and
-  per-scope concurrency saturation;
+- active actions, admission wait/denial, timeouts, cancellations, output
+  truncation, and global/per-principal/per-capability saturation;
 - DNS answer changes, redirect denials, and effective destination traces; and
 - clock health and deviation beyond approval skew policy.
 

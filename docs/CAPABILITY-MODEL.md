@@ -101,7 +101,7 @@ Every invocation still requires descriptor and policy checks.
 | `GitWrite` | repository root ID and typed mutation -> structured Git result/change evidence | `REVERSIBLE_CHANGE` or `EXTERNAL_SIDE_EFFECT` for remote writes | Declared; fail closed until explicit backend |
 | `HttpRequest` | method, URL, bounded headers/body -> status, bounded headers/body, destination trace | `EXTERNAL_SIDE_EFFECT` | Local HTTP |
 | `BrowserAction` | browser/session ID and typed navigation/input operation -> structured browser result | `EXTERNAL_SIDE_EFFECT` | Declared; fail closed until explicit backend |
-| `ProcessInspect` | typed filter and field selection -> bounded process records | `READ_ONLY` | Declared; fail closed until explicit backend |
+| `ProcessInspect` | typed list or PID selection -> bounded, redacted process records | `READ_ONLY` | Linux `/proc`, disabled unless UID-scoped in policy |
 | `ServiceInspect` | service manager/name and typed query -> structured service state | `READ_ONLY` | Declared; fail closed until explicit backend |
 | `ServiceControl` | service manager/name and typed transition -> before/after state | `PRIVILEGED_CHANGE` | Declared; fail closed until explicit backend |
 | `ContainerAction` | runtime/container ID and typed operation -> structured runtime result | `PRIVILEGED_CHANGE` or `DESTRUCTIVE` | Declared; fail closed until explicit backend |
@@ -133,6 +133,29 @@ Generic filesystem capabilities treat `.git` as protected metadata and cannot
 be used to approximate either Git capability. Git reads hold the configured
 root's mutation lock for the complete operation so broker-mediated filesystem
 mutations cannot race metadata validation.
+
+## Process inspection capability
+
+`ProcessInspect` supports a bounded process list and one exact PID lookup. The
+trusted daemon configuration must explicitly enable it, list one or more
+unprivileged numeric UIDs, and set the maximum result count. UID 0 is always
+rejected. A request cannot widen either scope.
+
+The Linux backend reads `/proc/<pid>/status`, `/proc/<pid>/stat`, and the
+kernel-owned `exe` link directly. It compares UID, PID, parent PID, and process
+start time before and after inspection so a recycled PID does not silently
+change identity. It returns only the executable basename. The
+`arguments_redacted` array is empty because the backend never opens `cmdline`;
+it also never opens `environ`, file descriptors, memory, namespaces, or process
+roots. Listing silently omits processes outside policy and processes that exit
+during the bounded scan. Exact lookup returns one generic unavailable error so
+it does not reveal whether a denied PID exists. The complete inspection has a
+two-second wall-clock deadline and observes cancellation between bounded reads.
+
+The backend fails closed on non-Linux hosts. Fixture tests exercise parsing,
+UID filtering, output bounds, cancellation, malformed metadata, and symlink
+rejection on every development platform; production qualification still
+requires the Linux deployment profile and its actual procfs mount policy.
 
 Policy rejects absolute paths, parent traversal, platform prefix tricks,
 forbidden pseudo-filesystems, device files, secret roots, and symlink/reparse
@@ -180,7 +203,7 @@ environment.
 
 ## Remaining declared host-specific capabilities
 
-Git write, browser, process, service, container, and node actions must be
+Git write, browser, service, container, and node actions must be
 implemented as typed backends. Dispatching them through
 `ExecuteApprovedCommand` as a fallback would collapse their schemas and
 permission boundaries, so it is forbidden. An implementation is enabled only

@@ -13,6 +13,7 @@ cap-std.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true
 git2.workspace = true
+libc.workspace = true
 parking_lot.workspace = true
 regex.workspace = true
 reqwest.workspace = true
