@@ -12,8 +12,9 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use action_broker_core::approval::{
-    APPROVAL_TOKEN_VERSION, ApprovalClaimsV1, ApprovalVerifier, ApprovalVerifierConfig,
-    InMemoryReplayStore, SignedApprovalTokenV1, TrustedKeyLifecycle, TrustedKeyRegistry,
+    APPROVAL_TOKEN_VERSION, ApprovalClaimsV1, ApprovalError, ApprovalVerifier,
+    ApprovalVerifierConfig, InMemoryReplayStore, SignedApprovalTokenV1, TrustedKeyLifecycle,
+    TrustedKeyRegistry,
 };
 use action_broker_core::capability::{
     ApprovalType, CapabilityAction, ExecuteApprovedCommandInput, RootedPath,
@@ -29,6 +30,7 @@ use uuid::Uuid;
 const KEY_ID: &str = "lifecycle-test-key";
 const TEST_SIGNING_SEED: [u8; 32] = [7_u8; 32];
 const APPROVAL_LIFETIME_SECONDS: i64 = 60;
+const EXPIRED_APPROVAL_AGE_SECONDS: i64 = 120;
 
 fn main() {
     if let Err(error) = run() {
@@ -46,9 +48,14 @@ fn run() -> Result<(), Box<dyn Error>> {
             reject_extra(&mut arguments)?;
             println!("{}", hex::encode(signing_key().verifying_key().as_bytes()));
         }
-        "request" => issue_request(&mut arguments)?,
+        "request" => issue_request(&mut arguments, false)?,
+        "expired-request" => issue_request(&mut arguments, true)?,
         "verify" => verify_request_file(&mut arguments)?,
-        _ => return Err(invalid("mode must be public-key, request, or verify").into()),
+        _ => {
+            return Err(
+                invalid("mode must be public-key, request, expired-request, or verify").into(),
+            );
+        }
     }
     Ok(())
 }
@@ -61,7 +68,10 @@ fn verify_request_file(arguments: &mut impl Iterator<Item = String>) -> Result<(
     verify_fixture_request(&request)
 }
 
-fn issue_request(arguments: &mut impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+fn issue_request(
+    arguments: &mut impl Iterator<Item = String>,
+    expired: bool,
+) -> Result<(), Box<dyn Error>> {
     let request_id = Uuid::parse_str(&required(arguments, "request_id")?)?;
     let program_id = required(arguments, "program_id")?;
     let root_id = required(arguments, "root_id")?;
@@ -91,7 +101,12 @@ fn issue_request(arguments: &mut impl Iterator<Item = String>) -> Result<(), Box
         }),
         approval_token: None,
     };
-    let issued_at = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())?;
+    let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())?;
+    let issued_at = if expired {
+        now.saturating_sub(EXPIRED_APPROVAL_AGE_SECONDS)
+    } else {
+        now
+    };
     let claims = ApprovalClaimsV1 {
         version: APPROVAL_TOKEN_VERSION,
         request_id: request.request_id,
@@ -117,13 +132,34 @@ fn issue_request(arguments: &mut impl Iterator<Item = String>) -> Result<(), Box
         }
         .to_compact()?,
     );
-    verify_fixture_request(&request)?;
+    if expired {
+        verify_expired_fixture_request(&request)?;
+    } else {
+        verify_fixture_request(&request)?;
+    }
     serde_json::to_writer(io::stdout().lock(), &request)?;
     io::stdout().lock().write_all(b"\n")?;
     Ok(())
 }
 
 fn verify_fixture_request(request: &ActionRequest) -> Result<(), Box<dyn Error>> {
+    let verifier = fixture_verifier()?;
+    let _verified = verifier.verify_embedded(request, &[ApprovalType::ElevatedUser])?;
+    Ok(())
+}
+
+fn verify_expired_fixture_request(request: &ActionRequest) -> Result<(), Box<dyn Error>> {
+    let verifier = fixture_verifier()?;
+    if !matches!(
+        verifier.verify_embedded(request, &[ApprovalType::ElevatedUser]),
+        Err(ApprovalError::Expired)
+    ) {
+        return Err(invalid("expired fixture request was not rejected as expired").into());
+    }
+    Ok(())
+}
+
+fn fixture_verifier() -> Result<ApprovalVerifier, ApprovalError> {
     let mut keys = TrustedKeyRegistry::new();
     keys.insert(
         KEY_ID,
@@ -134,13 +170,11 @@ fn verify_fixture_request(request: &ActionRequest) -> Result<(), Box<dyn Error>>
             revoke_at_unix_seconds: None,
         },
     )?;
-    let verifier = ApprovalVerifier::new(
+    ApprovalVerifier::new(
         keys,
         Arc::new(InMemoryReplayStore::default()),
         ApprovalVerifierConfig::default(),
-    )?;
-    let _verified = verifier.verify_embedded(request, &[ApprovalType::ElevatedUser])?;
-    Ok(())
+    )
 }
 
 fn signing_key() -> SigningKey {

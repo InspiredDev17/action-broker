@@ -291,21 +291,24 @@ verifies a typed read allow path, an
 unconfigured same-IPC-group UID deny path and Agent Green event, an in-flight
 partial-frame first-signal drain, exact socket cleanup, the audit chain, and a
 restart using the same durable files. It also issues a short-lived, exact-scope
-test approval through the repository's Rust/JCS model. First it changes the
-signed command argument without changing the token, requires a broker-confirmed
-`approval_invalid` rejection and Agent Green evidence, and proves no audit start
-or process launch occurred. The original token must then still authorize the
-exact command, proving the failed binding check did not consume its nonce. The
-harness sends `SIGTERM`, requires a broker-confirmed cancelled result, and proves
-no process under the broker test UID survives. After reopening the same SQLite
-ledger, it resubmits that exact token and requires a
-broker-confirmed `approval_replayed` rejection, no second command or audit
-start, and mandatory Agent Green identity/capability evidence. The embedded
-fixture signing key must never appear in production trust configuration; its
-binary is excluded from normal builds unless `lifecycle-test-fixture` is
-explicitly enabled. A pass qualifies this narrow lifecycle on the tested Linux
-host only; it does not attest cgroups, seccomp, general command containment,
-external effects, or the production service-manager profile.
+test approval through the repository's Rust/JCS model. First it submits a
+correctly signed but expired token, requires a broker-confirmed
+`approval_expired` rejection and Agent Green evidence, and proves no audit start
+or process launch occurred. It then issues a current token with the same request
+ID and nonce, changes the signed command argument without changing that token,
+and requires `approval_invalid` with the same no-effect guarantees. The original
+current token must still authorize the exact command, proving neither expiry nor
+failed binding consumed its nonce. The harness sends `SIGTERM`, requires a
+broker-confirmed cancelled result, and proves no process under the broker test
+UID survives. After reopening the same SQLite ledger, it resubmits that exact
+token and requires a broker-confirmed `approval_replayed` rejection, no second
+command or audit start, and mandatory Agent Green identity/capability evidence.
+The embedded fixture signing key must never appear in production trust
+configuration; its binary is excluded from normal builds unless the
+`lifecycle-test-fixture` feature is explicitly enabled. A pass qualifies this
+narrow lifecycle on the tested Linux host only; it does not attest cgroups,
+seccomp, general command containment, external effects, or the production
+service-manager profile.
 
 Containerized qualification requires an outer runner that permits unprivileged
 user namespaces and their private mounts. If the container runtime blocks

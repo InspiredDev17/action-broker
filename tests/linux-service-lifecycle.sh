@@ -139,6 +139,7 @@ readonly event_path="$state_dir/agent-green.jsonl"
 readonly daemon_log="$test_root/daemon.log"
 readonly hold_marker="$control_dir/hold-ready"
 readonly command_request="$control_dir/command-request.json"
+readonly expired_command_request="$control_dir/expired-command-request.json"
 readonly tampered_command_request="$control_dir/tampered-command-request.json"
 readonly normalized_command_request="$test_root/normalized-command-request.json"
 readonly command_request_id='018f47d2-60d2-7af0-bc35-2a1f7f5a6d02'
@@ -338,8 +339,33 @@ setpriv --reuid "$platform_uid" --regid "$ipc_gid" --clear-groups \
   --mode read --socket "$socket_path" --broker-uid "$broker_uid" \
   --root-id lifecycle --relative-path probe.txt --expected-content $'lifecycle-ok\n' --timeout 5s
 
-# Issue an exact short-lived approval using the same Rust request and JCS model
-# as the broker. The private test seed exists only in the fixture executable.
+# Submit a correctly signed but expired approval first. The later valid request
+# deliberately reuses its request ID and nonce, proving expiry rejection did not
+# consume the nonce.
+setpriv --reuid "$platform_uid" --regid "$ipc_gid" --clear-groups \
+  env -i "$bin_dir/issue-lifecycle-approval" expired-request \
+  "$command_request_id" lifecycle-sleep lifecycle . 30000 lifecycle-command-nonce-0001 \
+  >"$expired_command_request"
+chown "$platform_uid:$ipc_gid" "$expired_command_request"
+chmod 0600 "$expired_command_request"
+setpriv --reuid "$platform_uid" --regid "$ipc_gid" --clear-groups \
+  env -i "$bin_dir/lifecycletestclient" \
+  --mode execute-and-expect-approval-expired --socket "$socket_path" --broker-uid "$broker_uid" \
+  --request "$expired_command_request" --timeout 5s
+if pgrep -u "$broker_uid" -x sleep >/dev/null 2>&1; then
+  fail 'expired approval started a sandboxed command'
+fi
+jq -e -s --arg request_id "$command_request_id" '
+  any(.[]; .kind == "expired_approval" and .request_id == $request_id and
+    .reason_code == "approval_expired" and .user_id == "lifecycle-user" and
+    .agent_id == "lifecycle-agent" and .task_id == "lifecycle-command-cancellation" and
+    .capability == "ExecuteApprovedCommand" and (.target_digest | length == 64))
+' "$event_path" >/dev/null
+audit_summary=$("$bin_dir/action-brokerd" verify-audit --path "$audit_path")
+jq -e '.record_count == 2 and (.head_sha256 | length == 64)' <<<"$audit_summary" >/dev/null
+
+# Issue an exact currently valid approval using the same Rust request and JCS
+# model as the broker. The private test seed exists only in the fixture binary.
 setpriv --reuid "$platform_uid" --regid "$ipc_gid" --clear-groups \
   env -i "$bin_dir/issue-lifecycle-approval" request \
   "$command_request_id" lifecycle-sleep lifecycle . 30000 lifecycle-command-nonce-0001 \

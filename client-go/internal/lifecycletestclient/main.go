@@ -27,7 +27,7 @@ func main() {
 }
 
 func run() error {
-	mode := flag.String("mode", "read", "probe mode: read, execute-and-expect-approval-invalid, execute-and-expect-cancel, execute-and-expect-replay, or hold-incomplete-frame")
+	mode := flag.String("mode", "read", "probe mode: read, execute-and-expect-approval-expired, execute-and-expect-approval-invalid, execute-and-expect-cancel, execute-and-expect-replay, or hold-incomplete-frame")
 	socketPath := flag.String("socket", "", "absolute broker Unix-socket path")
 	brokerUID := flag.Uint64("broker-uid", 0, "expected unprivileged broker UID")
 	rootID := flag.String("root-id", "lifecycle", "broker filesystem root ID")
@@ -48,6 +48,8 @@ func run() error {
 	switch *mode {
 	case "read":
 		return readProbe(*socketPath, uint32(*brokerUID), *rootID, *relativePath, *expectedContent, *timeout)
+	case "execute-and-expect-approval-expired":
+		return executeAndExpectBrokerError(*socketPath, uint32(*brokerUID), *requestPath, *timeout, actionbroker.StatusRejected, "approval_expired")
 	case "execute-and-expect-approval-invalid":
 		return executeAndExpectBrokerError(*socketPath, uint32(*brokerUID), *requestPath, *timeout, actionbroker.StatusRejected, "approval_invalid")
 	case "execute-and-expect-cancel":
