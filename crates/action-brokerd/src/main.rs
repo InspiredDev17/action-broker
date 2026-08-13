@@ -46,6 +46,7 @@ const MAX_KEY_BYTES: u64 = 4096;
 const SOCKET_MODE: u32 = 0o660;
 const MAXIMUM_OPEN_CONNECTIONS: usize = 128;
 const MAXIMUM_CONNECTION_WORKERS: usize = 64;
+const MAXIMUM_AUTHENTICATION_FAILURES_PER_WINDOW: usize = 1_024;
 const MINIMUM_TRANSPORT_TIMEOUT_MILLISECONDS: u64 = 100;
 const MAXIMUM_TRANSPORT_TIMEOUT_MILLISECONDS: u64 = 30_000;
 
@@ -66,6 +67,41 @@ struct ConnectionAdmission {
 enum ConnectionAdmissionDenial {
     GlobalLimit,
     PeerLimit,
+}
+
+#[derive(Debug)]
+struct TransportAuthenticationFailureGate {
+    window_started_at: Instant,
+    failures_in_window: usize,
+    maximum_failures_per_window: usize,
+    window: Duration,
+}
+
+impl TransportAuthenticationFailureGate {
+    fn new(limits: &TransportLimitsWireConfig) -> Self {
+        Self {
+            window_started_at: Instant::now(),
+            failures_in_window: 0,
+            maximum_failures_per_window: limits.maximum_authentication_failures_per_window,
+            window: Duration::from_millis(limits.authentication_failure_window_milliseconds),
+        }
+    }
+
+    fn record_failure_at(&mut self, now: Instant) -> Option<Duration> {
+        let elapsed = now.saturating_duration_since(self.window_started_at);
+        if elapsed >= self.window {
+            self.window_started_at = now;
+            self.failures_in_window = 0;
+        }
+        self.failures_in_window = self.failures_in_window.saturating_add(1);
+        if self.failures_in_window < self.maximum_failures_per_window {
+            return None;
+        }
+        Some(
+            self.window
+                .saturating_sub(now.saturating_duration_since(self.window_started_at)),
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -337,6 +373,8 @@ struct TransportLimitsWireConfig {
     worker_threads: usize,
     maximum_queued_connections: usize,
     maximum_queue_wait_milliseconds: u64,
+    maximum_authentication_failures_per_window: usize,
+    authentication_failure_window_milliseconds: u64,
     read_timeout_milliseconds: u64,
     write_timeout_milliseconds: u64,
 }
@@ -426,6 +464,8 @@ fn serve(config_path: &Path) -> Result<(), BrokerError> {
         Arc::clone(&security_events),
     )?);
     let admission = ConnectionAdmission::new(&config.transport_limits);
+    let mut authentication_failure_gate =
+        TransportAuthenticationFailureGate::new(&config.transport_limits);
     let worker_pool = ConnectionWorkerPool::new(
         Arc::clone(&broker),
         Arc::clone(&security_events),
@@ -437,9 +477,19 @@ fn serve(config_path: &Path) -> Result<(), BrokerError> {
             continue;
         };
         let Some(peer_uid) = peer_uid(&stream) else {
+            report_transport_authentication_failure(
+                security_events.as_ref(),
+                &mut authentication_failure_gate,
+                "peer_credentials_unavailable",
+            )?;
             continue;
         };
         let Some(authenticated_requester) = peer_principals.get(&peer_uid).cloned() else {
+            report_transport_authentication_failure(
+                security_events.as_ref(),
+                &mut authentication_failure_gate,
+                "unauthorized_platform_peer",
+            )?;
             continue;
         };
         let connection_permit = match admission.try_acquire(peer_uid)? {
@@ -757,6 +807,11 @@ fn validate_transport_limits(limits: &TransportLimitsWireConfig) -> Result<(), B
         || limits.maximum_queued_connections > limits.maximum_open_connections
         || !(MINIMUM_TRANSPORT_TIMEOUT_MILLISECONDS..=MAXIMUM_TRANSPORT_TIMEOUT_MILLISECONDS)
             .contains(&limits.maximum_queue_wait_milliseconds)
+        || limits.maximum_authentication_failures_per_window == 0
+        || limits.maximum_authentication_failures_per_window
+            > MAXIMUM_AUTHENTICATION_FAILURES_PER_WINDOW
+        || !(MINIMUM_TRANSPORT_TIMEOUT_MILLISECONDS..=MAXIMUM_TRANSPORT_TIMEOUT_MILLISECONDS)
+            .contains(&limits.authentication_failure_window_milliseconds)
         || !(MINIMUM_TRANSPORT_TIMEOUT_MILLISECONDS..=MAXIMUM_TRANSPORT_TIMEOUT_MILLISECONDS)
             .contains(&limits.read_timeout_milliseconds)
         || !(MINIMUM_TRANSPORT_TIMEOUT_MILLISECONDS..=MAXIMUM_TRANSPORT_TIMEOUT_MILLISECONDS)
@@ -799,6 +854,21 @@ fn emit_connection_overload(
     event.user_id = Some(authenticated_requester.user_id.clone());
     event.agent_id = Some(authenticated_requester.agent_id.clone());
     security_events.emit(&event)
+}
+
+fn report_transport_authentication_failure(
+    security_events: &dyn SecurityEventSink,
+    failure_gate: &mut TransportAuthenticationFailureGate,
+    reason_code: &'static str,
+) -> Result<(), BrokerError> {
+    security_events.emit(&SecurityEvent::new(
+        SecurityEventKind::PermissionBypassAttempt,
+        reason_code,
+    ))?;
+    if let Some(backoff) = failure_gate.record_failure_at(Instant::now()) {
+        thread::sleep(backoff);
+    }
+    Ok(())
 }
 
 fn refuse_root() -> Result<(), BrokerError> {
@@ -993,6 +1063,8 @@ mod tests {
             worker_threads,
             maximum_queued_connections: maximum_open_connections,
             maximum_queue_wait_milliseconds: 1_000,
+            maximum_authentication_failures_per_window: 16,
+            authentication_failure_window_milliseconds: 1_000,
             read_timeout_milliseconds: 5_000,
             write_timeout_milliseconds: 5_000,
         }
@@ -1116,15 +1188,17 @@ mod tests {
 
     #[test]
     fn transport_admission_limits_are_required_strict_and_bounded() -> Result<(), Box<dyn Error>> {
-        let valid = br#"{"maximum_open_connections":32,"maximum_open_connections_per_peer":8,"worker_threads":8,"maximum_queued_connections":16,"maximum_queue_wait_milliseconds":1000,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000}"#;
+        let valid = br#"{"maximum_open_connections":32,"maximum_open_connections_per_peer":8,"worker_threads":8,"maximum_queued_connections":16,"maximum_queue_wait_milliseconds":1000,"maximum_authentication_failures_per_window":16,"authentication_failure_window_milliseconds":1000,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000}"#;
         let decoded = decode_strict::<TransportLimitsWireConfig>(valid)?;
         validate_transport_limits(&decoded)?;
 
-        let missing_per_peer = br#"{"maximum_open_connections":32,"worker_threads":8,"maximum_queued_connections":16,"maximum_queue_wait_milliseconds":1000,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000}"#;
+        let missing_per_peer = br#"{"maximum_open_connections":32,"worker_threads":8,"maximum_queued_connections":16,"maximum_queue_wait_milliseconds":1000,"maximum_authentication_failures_per_window":16,"authentication_failure_window_milliseconds":1000,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000}"#;
         assert!(decode_strict::<TransportLimitsWireConfig>(missing_per_peer).is_err());
-        let missing_queue_wait = br#"{"maximum_open_connections":32,"maximum_open_connections_per_peer":8,"worker_threads":8,"maximum_queued_connections":16,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000}"#;
+        let missing_queue_wait = br#"{"maximum_open_connections":32,"maximum_open_connections_per_peer":8,"worker_threads":8,"maximum_queued_connections":16,"maximum_authentication_failures_per_window":16,"authentication_failure_window_milliseconds":1000,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000}"#;
         assert!(decode_strict::<TransportLimitsWireConfig>(missing_queue_wait).is_err());
-        let bypass = br#"{"maximum_open_connections":32,"maximum_open_connections_per_peer":8,"worker_threads":8,"maximum_queued_connections":16,"maximum_queue_wait_milliseconds":1000,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000,"unbounded":true}"#;
+        let missing_authentication_window = br#"{"maximum_open_connections":32,"maximum_open_connections_per_peer":8,"worker_threads":8,"maximum_queued_connections":16,"maximum_queue_wait_milliseconds":1000,"maximum_authentication_failures_per_window":16,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000}"#;
+        assert!(decode_strict::<TransportLimitsWireConfig>(missing_authentication_window).is_err());
+        let bypass = br#"{"maximum_open_connections":32,"maximum_open_connections_per_peer":8,"worker_threads":8,"maximum_queued_connections":16,"maximum_queue_wait_milliseconds":1000,"maximum_authentication_failures_per_window":16,"authentication_failure_window_milliseconds":1000,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000,"unbounded":true}"#;
         assert!(decode_strict::<TransportLimitsWireConfig>(bypass).is_err());
 
         assert!(validate_transport_limits(&transport_limits(0, 0, 0)).is_err());
@@ -1143,6 +1217,18 @@ mod tests {
         let mut long_queue_wait = transport_limits(8, 4, 4);
         long_queue_wait.maximum_queue_wait_milliseconds = 30_001;
         assert!(validate_transport_limits(&long_queue_wait).is_err());
+        let mut no_authentication_failures = transport_limits(8, 4, 4);
+        no_authentication_failures.maximum_authentication_failures_per_window = 0;
+        assert!(validate_transport_limits(&no_authentication_failures).is_err());
+        let mut excessive_authentication_failures = transport_limits(8, 4, 4);
+        excessive_authentication_failures.maximum_authentication_failures_per_window = 1_025;
+        assert!(validate_transport_limits(&excessive_authentication_failures).is_err());
+        let mut short_authentication_window = transport_limits(8, 4, 4);
+        short_authentication_window.authentication_failure_window_milliseconds = 99;
+        assert!(validate_transport_limits(&short_authentication_window).is_err());
+        let mut long_authentication_window = transport_limits(8, 4, 4);
+        long_authentication_window.authentication_failure_window_milliseconds = 30_001;
+        assert!(validate_transport_limits(&long_authentication_window).is_err());
         let mut short_timeout = transport_limits(8, 4, 4);
         short_timeout.read_timeout_milliseconds = 99;
         assert!(validate_transport_limits(&short_timeout).is_err());
@@ -1311,6 +1397,63 @@ mod tests {
             ),
             Ok(false)
         ));
+    }
+
+    #[test]
+    fn authentication_failure_gate_backs_off_at_threshold_and_resets() {
+        let limits = transport_limits(8, 4, 4);
+        let mut gate = TransportAuthenticationFailureGate::new(&limits);
+        gate.maximum_failures_per_window = 3;
+        gate.window = Duration::from_secs(1);
+        let started_at = gate.window_started_at;
+
+        assert_eq!(gate.record_failure_at(started_at), None);
+        assert_eq!(
+            gate.record_failure_at(started_at + Duration::from_millis(250)),
+            None
+        );
+        assert_eq!(
+            gate.record_failure_at(started_at + Duration::from_millis(500)),
+            Some(Duration::from_millis(500))
+        );
+        assert_eq!(
+            gate.record_failure_at(started_at + Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(gate.failures_in_window, 1);
+    }
+
+    #[test]
+    fn transport_authentication_failure_event_is_secret_free() -> Result<(), Box<dyn Error>> {
+        let sink = RecordingSecurityEventSink {
+            events: Mutex::new(Vec::new()),
+        };
+        let mut gate = TransportAuthenticationFailureGate::new(&transport_limits(8, 4, 4));
+        report_transport_authentication_failure(&sink, &mut gate, "unauthorized_platform_peer")?;
+
+        let events = sink.events.lock().map_err(|_| "event lock")?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, SecurityEventKind::PermissionBypassAttempt);
+        assert_eq!(events[0].reason_code, "unauthorized_platform_peer");
+        assert!(events[0].request_id.is_none());
+        assert!(events[0].user_id.is_none());
+        assert!(events[0].agent_id.is_none());
+        assert!(events[0].target_digest.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn transport_authentication_failure_stops_when_event_fails() {
+        let mut gate = TransportAuthenticationFailureGate::new(&transport_limits(8, 4, 4));
+        assert!(matches!(
+            report_transport_authentication_failure(
+                &FailingSecurityEventSink,
+                &mut gate,
+                "peer_credentials_unavailable",
+            ),
+            Err(error) if error.code == ErrorCode::SecurityEventFailure
+        ));
+        assert_eq!(gate.failures_in_window, 0);
     }
 
     #[test]

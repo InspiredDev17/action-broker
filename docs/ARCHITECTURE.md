@@ -85,6 +85,14 @@ transport abuse. Capacity and queue-age rejection emit a secret-free Agent Green
 `resource_abuse_pattern` event before request JSON is parsed. Peer access never
 substitutes for permission or approval.
 
+An accepted socket whose kernel peer credentials cannot be obtained, or whose
+UID has no root-configured principal, is closed before request parsing and emits
+a secret-free `permission_bypass_attempt`. To prevent a local unauthorized peer
+from filling the mandatory event spool without bound, the accept loop pauses for
+the rest of a configured time window after a configured number of failures.
+Every socket accepted before that pause receives its event; failures are not
+silently sampled or converted into identity claims.
+
 The daemon fails closed on platforms where this implementation cannot obtain a
 supported peer UID. A future macOS transport must provide an equally explicit,
 tested principal binding before `serve` is enabled there.

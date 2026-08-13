@@ -94,6 +94,8 @@ Action Broker is designed to fail closed:
 - the local transport uses atomic global/per-peer connection admission, a fixed
   worker set, an explicitly bounded socket queue with a residence deadline, and
   configured read/write deadlines;
+- unavailable peer credentials and unconfigured peer UIDs are denied before
+  parsing and produce bounded, secret-free Agent Green bypass events;
 - daemon readiness and every action verify exact real/effective/saved/fs IDs,
   supplementary groups, empty active Linux capability sets, and inherited
   `NoNewPrivs`; and

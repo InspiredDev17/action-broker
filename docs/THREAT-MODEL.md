@@ -88,7 +88,7 @@ The broker emits structured Agent Green events for at least:
 
 | Event | Trigger |
 | --- | --- |
-| `permission_bypass_attempt` | Missing permission, privilege/scope downgrade attempt, or conflicting identity assertion |
+| `permission_bypass_attempt` | Missing permission, unavailable peer credentials, unconfigured peer UID, privilege/scope downgrade attempt, or conflicting identity assertion |
 | `expired_approval` | Approval outside its accepted time window |
 | `replayed_approval` | Nonce already consumed or concurrent replay loses atomic consumption |
 | `path_escape` | Absolute/traversal/link/mount resolution outside the selected root |
@@ -147,6 +147,12 @@ subprocess output, and audit/event record size. Admission is one atomic
 global/per-peer state transition, so concurrent accepts cannot overshoot either
 bound. Capacity and queue-age rejection of authenticated peers produce mandatory
 secret-free Agent Green resource-abuse events before request parsing.
+Peer-credential failures and unconfigured peer UIDs are likewise rejected and
+recorded before parsing. A configured failure-window breaker pauses the accept
+loop after its threshold, bounding event growth without silently accepting or
+sampling an already accepted authentication failure. This deliberately permits
+a member of the local IPC group to delay service; narrow group membership and
+host-level connection controls remain part of the availability boundary.
 The broker enforces bounded global, per-principal, and per-capability in-flight
 counts. Admission waits are bounded and cancellation-aware. It does not provide
 weighted fairness, persistent queues, or per-principal scheduling guarantees;
