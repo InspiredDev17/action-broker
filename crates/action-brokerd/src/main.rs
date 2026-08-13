@@ -4,6 +4,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -46,9 +47,10 @@ const MAX_KEY_BYTES: u64 = 4096;
 const SOCKET_MODE: u32 = 0o660;
 const MAXIMUM_OPEN_CONNECTIONS: usize = 128;
 const MAXIMUM_CONNECTION_WORKERS: usize = 64;
-const MAXIMUM_AUTHENTICATION_FAILURES_PER_WINDOW: usize = 1_024;
+const MAXIMUM_FAILURES_PER_WINDOW: usize = 1_024;
 const MINIMUM_TRANSPORT_TIMEOUT_MILLISECONDS: u64 = 100;
 const MAXIMUM_TRANSPORT_TIMEOUT_MILLISECONDS: u64 = 30_000;
+const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Default)]
 struct ConnectionAdmissionState {
@@ -70,20 +72,20 @@ enum ConnectionAdmissionDenial {
 }
 
 #[derive(Debug)]
-struct TransportAuthenticationFailureGate {
+struct FailureWindowGate {
     window_started_at: Instant,
     failures_in_window: usize,
     maximum_failures_per_window: usize,
     window: Duration,
 }
 
-impl TransportAuthenticationFailureGate {
-    fn new(limits: &TransportLimitsWireConfig) -> Self {
+impl FailureWindowGate {
+    fn new(maximum_failures_per_window: usize, window: Duration) -> Self {
         Self {
             window_started_at: Instant::now(),
             failures_in_window: 0,
-            maximum_failures_per_window: limits.maximum_authentication_failures_per_window,
-            window: Duration::from_millis(limits.authentication_failure_window_milliseconds),
+            maximum_failures_per_window,
+            window,
         }
     }
 
@@ -103,6 +105,19 @@ impl TransportAuthenticationFailureGate {
         )
     }
 }
+
+#[derive(Debug)]
+struct ProtocolRejection {
+    reason_code: &'static str,
+}
+
+impl std::fmt::Display for ProtocolRejection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.reason_code)
+    }
+}
+
+impl std::error::Error for ProtocolRejection {}
 
 #[derive(Debug)]
 struct ConnectionPermit {
@@ -179,7 +194,19 @@ struct ConnectionJob {
 
 struct ConnectionWorkerPool {
     sender: SyncSender<ConnectionJob>,
+    healthy: Arc<AtomicBool>,
     _workers: Vec<thread::JoinHandle<()>>,
+}
+
+#[derive(Clone)]
+struct ConnectionWorkerRuntime {
+    broker: Arc<ActionBroker>,
+    security_events: Arc<dyn SecurityEventSink>,
+    protocol_failure_gate: Arc<Mutex<FailureWindowGate>>,
+    healthy: Arc<AtomicBool>,
+    maximum_queue_wait: Duration,
+    read_timeout: Duration,
+    write_timeout: Duration,
 }
 
 impl ConnectionWorkerPool {
@@ -190,25 +217,31 @@ impl ConnectionWorkerPool {
     ) -> Result<Self, BrokerError> {
         let (sender, receiver) = mpsc::sync_channel(limits.maximum_queued_connections);
         let receiver = Arc::new(Mutex::new(receiver));
+        let protocol_failure_gate = Arc::new(Mutex::new(FailureWindowGate::new(
+            limits.maximum_protocol_failures_per_window,
+            Duration::from_millis(limits.protocol_failure_window_milliseconds),
+        )));
+        let healthy = Arc::new(AtomicBool::new(true));
         let maximum_queue_wait = Duration::from_millis(limits.maximum_queue_wait_milliseconds);
         let read_timeout = Duration::from_millis(limits.read_timeout_milliseconds);
         let write_timeout = Duration::from_millis(limits.write_timeout_milliseconds);
+        let runtime = ConnectionWorkerRuntime {
+            broker,
+            security_events,
+            protocol_failure_gate,
+            healthy: Arc::clone(&healthy),
+            maximum_queue_wait,
+            read_timeout,
+            write_timeout,
+        };
         let mut workers = Vec::with_capacity(limits.worker_threads);
         for worker_index in 0..limits.worker_threads {
-            let broker = Arc::clone(&broker);
             let receiver = Arc::clone(&receiver);
-            let security_events = Arc::clone(&security_events);
+            let runtime = runtime.clone();
             let worker = thread::Builder::new()
                 .name(format!("action-broker-connection-{worker_index}"))
                 .spawn(move || {
-                    connection_worker(
-                        receiver,
-                        broker,
-                        security_events,
-                        maximum_queue_wait,
-                        read_timeout,
-                        write_timeout,
-                    );
+                    connection_worker(receiver, runtime);
                 })
                 .map_err(|_| {
                     BrokerError::new(ErrorCode::Internal, "connection worker could not start")
@@ -217,6 +250,7 @@ impl ConnectionWorkerPool {
         }
         Ok(Self {
             sender,
+            healthy,
             _workers: workers,
         })
     }
@@ -224,17 +258,20 @@ impl ConnectionWorkerPool {
     fn try_submit(&self, job: ConnectionJob) -> Result<(), TrySendError<ConnectionJob>> {
         self.sender.try_send(job)
     }
+
+    fn is_healthy(&self) -> bool {
+        self.healthy.load(Ordering::Acquire)
+    }
 }
 
 fn connection_worker(
     receiver: Arc<Mutex<Receiver<ConnectionJob>>>,
-    broker: Arc<ActionBroker>,
-    security_events: Arc<dyn SecurityEventSink>,
-    maximum_queue_wait: Duration,
-    read_timeout: Duration,
-    write_timeout: Duration,
+    runtime: ConnectionWorkerRuntime,
 ) {
     loop {
+        if !runtime.healthy.load(Ordering::Acquire) {
+            return;
+        }
         let job = {
             let Ok(receiver) = receiver.lock() else {
                 return;
@@ -252,24 +289,35 @@ fn connection_worker(
         } = job;
         let _connection_permit = connection_permit;
         match reject_expired_connection(
-            security_events.as_ref(),
+            runtime.security_events.as_ref(),
             &authenticated_requester,
             accepted_at.elapsed(),
-            maximum_queue_wait,
+            runtime.maximum_queue_wait,
         ) {
             Ok(true) => continue,
             Ok(false) => {}
             Err(_) => {
+                runtime.healthy.store(false, Ordering::Release);
                 return;
             }
         }
-        let _ = handle_connection(
-            Arc::clone(&broker),
-            authenticated_requester,
+        if let Ok(Some(reason_code)) = handle_connection(
+            Arc::clone(&runtime.broker),
+            &authenticated_requester,
             stream,
-            read_timeout,
-            write_timeout,
-        );
+            runtime.read_timeout,
+            runtime.write_timeout,
+        ) && report_authenticated_protocol_failure(
+            runtime.security_events.as_ref(),
+            &runtime.protocol_failure_gate,
+            &authenticated_requester,
+            reason_code,
+        )
+        .is_err()
+        {
+            runtime.healthy.store(false, Ordering::Release);
+            return;
+        }
     }
 }
 
@@ -375,6 +423,8 @@ struct TransportLimitsWireConfig {
     maximum_queue_wait_milliseconds: u64,
     maximum_authentication_failures_per_window: usize,
     authentication_failure_window_milliseconds: u64,
+    maximum_protocol_failures_per_window: usize,
+    protocol_failure_window_milliseconds: u64,
     read_timeout_milliseconds: u64,
     write_timeout_milliseconds: u64,
 }
@@ -464,17 +514,46 @@ fn serve(config_path: &Path) -> Result<(), BrokerError> {
         Arc::clone(&security_events),
     )?);
     let admission = ConnectionAdmission::new(&config.transport_limits);
-    let mut authentication_failure_gate =
-        TransportAuthenticationFailureGate::new(&config.transport_limits);
+    let mut authentication_failure_gate = FailureWindowGate::new(
+        config
+            .transport_limits
+            .maximum_authentication_failures_per_window,
+        Duration::from_millis(
+            config
+                .transport_limits
+                .authentication_failure_window_milliseconds,
+        ),
+    );
     let worker_pool = ConnectionWorkerPool::new(
         Arc::clone(&broker),
         Arc::clone(&security_events),
         &config.transport_limits,
     )?;
     let listener = bind_socket(&config.socket_path, config.socket_group_id)?;
-    for incoming in listener.incoming() {
-        let Ok(stream) = incoming else {
-            continue;
+    listener
+        .set_nonblocking(true)
+        .map_err(|_| transport_error("Unix socket nonblocking setup failed"))?;
+    loop {
+        if !worker_pool.is_healthy() {
+            return Err(BrokerError::new(
+                ErrorCode::SecurityEventFailure,
+                "connection worker mandatory security event reporting failed",
+            ));
+        }
+        let stream = match listener.accept() {
+            Ok((stream, _address)) => stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(ACCEPT_POLL_INTERVAL);
+                continue;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                emit_socket_accept_failure(security_events.as_ref())?;
+                return Err(BrokerError::new(
+                    ErrorCode::SandboxFailure,
+                    "Unix socket accept failed",
+                ));
+            }
         };
         let Some(peer_uid) = peer_uid(&stream) else {
             report_transport_authentication_failure(
@@ -534,10 +613,6 @@ fn serve(config_path: &Path) -> Result<(), BrokerError> {
             }
         }
     }
-    Err(BrokerError::new(
-        ErrorCode::Internal,
-        "Unix socket accept loop ended",
-    ))
 }
 
 fn build_broker(
@@ -625,24 +700,34 @@ fn build_broker(
 
 fn handle_connection(
     broker: Arc<ActionBroker>,
-    authenticated_requester: AuthenticatedRequester,
+    authenticated_requester: &AuthenticatedRequester,
     mut stream: UnixStream,
     read_timeout: Duration,
     write_timeout: Duration,
-) -> Result<(), BrokerError> {
+) -> Result<Option<&'static str>, BrokerError> {
+    stream
+        .set_nonblocking(false)
+        .map_err(|_| transport_error("accepted socket blocking setup failed"))?;
     stream
         .set_read_timeout(Some(read_timeout))
         .map_err(|_| transport_error("socket read timeout setup failed"))?;
     stream
         .set_write_timeout(Some(write_timeout))
         .map_err(|_| transport_error("socket write timeout setup failed"))?;
-    let frame = read_frame(&mut stream)?;
-    let request: ActionRequest = decode_strict(&frame)?;
+    let frame = match read_frame(&mut stream) {
+        Ok(frame) => frame,
+        Err(rejection) => return Ok(Some(rejection.reason_code)),
+    };
+    let request = match decode_action_request(&frame) {
+        Ok(request) => request,
+        Err(rejection) => return Ok(Some(rejection.reason_code)),
+    };
     let cancellation = CancellationToken::new();
     let worker_cancellation = cancellation.clone();
+    let execution_requester = authenticated_requester.clone();
     let (sender, receiver) = mpsc::sync_channel(1);
     thread::spawn(move || {
-        let response = broker.execute(request, &authenticated_requester, &worker_cancellation);
+        let response = broker.execute(request, &execution_requester, &worker_cancellation);
         let _ = sender.send(response);
     });
     stream
@@ -667,26 +752,35 @@ fn handle_connection(
     stream
         .set_nonblocking(false)
         .map_err(|_| transport_error("socket blocking mode restore failed"))?;
-    write_response(&mut stream, &response)
+    write_response(&mut stream, &response)?;
+    Ok(None)
 }
 
-fn read_frame(stream: &mut impl Read) -> Result<Vec<u8>, BrokerError> {
+fn read_frame(stream: &mut impl Read) -> Result<Vec<u8>, ProtocolRejection> {
     let mut prefix = [0_u8; 4];
     stream
         .read_exact(&mut prefix)
-        .map_err(|_| transport_error("request frame prefix is incomplete"))?;
+        .map_err(|_| protocol_rejection("request_frame_prefix_incomplete"))?;
     let length = usize::try_from(u32::from_be_bytes(prefix))
-        .map_err(|_| transport_error("request frame length is invalid"))?;
+        .map_err(|_| protocol_rejection("request_frame_size_invalid"))?;
     if length == 0 || length > MAX_FRAME_BYTES {
-        return Err(transport_error(
-            "request frame size is outside the safe bound",
-        ));
+        return Err(protocol_rejection("request_frame_size_invalid"));
     }
     let mut frame = vec![0_u8; length];
     stream
         .read_exact(&mut frame)
-        .map_err(|_| transport_error("request frame is incomplete"))?;
+        .map_err(|_| protocol_rejection("request_frame_incomplete"))?;
     Ok(frame)
+}
+
+fn decode_action_request(bytes: &[u8]) -> Result<ActionRequest, ProtocolRejection> {
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let request = ActionRequest::deserialize(&mut deserializer)
+        .map_err(|_| protocol_rejection("request_schema_invalid"))?;
+    deserializer
+        .end()
+        .map_err(|_| protocol_rejection("request_trailing_data"))?;
+    Ok(request)
 }
 
 fn write_response(stream: &mut UnixStream, response: &ActionResponse) -> Result<(), BrokerError> {
@@ -808,10 +902,13 @@ fn validate_transport_limits(limits: &TransportLimitsWireConfig) -> Result<(), B
         || !(MINIMUM_TRANSPORT_TIMEOUT_MILLISECONDS..=MAXIMUM_TRANSPORT_TIMEOUT_MILLISECONDS)
             .contains(&limits.maximum_queue_wait_milliseconds)
         || limits.maximum_authentication_failures_per_window == 0
-        || limits.maximum_authentication_failures_per_window
-            > MAXIMUM_AUTHENTICATION_FAILURES_PER_WINDOW
+        || limits.maximum_authentication_failures_per_window > MAXIMUM_FAILURES_PER_WINDOW
         || !(MINIMUM_TRANSPORT_TIMEOUT_MILLISECONDS..=MAXIMUM_TRANSPORT_TIMEOUT_MILLISECONDS)
             .contains(&limits.authentication_failure_window_milliseconds)
+        || limits.maximum_protocol_failures_per_window == 0
+        || limits.maximum_protocol_failures_per_window > MAXIMUM_FAILURES_PER_WINDOW
+        || !(MINIMUM_TRANSPORT_TIMEOUT_MILLISECONDS..=MAXIMUM_TRANSPORT_TIMEOUT_MILLISECONDS)
+            .contains(&limits.protocol_failure_window_milliseconds)
         || !(MINIMUM_TRANSPORT_TIMEOUT_MILLISECONDS..=MAXIMUM_TRANSPORT_TIMEOUT_MILLISECONDS)
             .contains(&limits.read_timeout_milliseconds)
         || !(MINIMUM_TRANSPORT_TIMEOUT_MILLISECONDS..=MAXIMUM_TRANSPORT_TIMEOUT_MILLISECONDS)
@@ -856,9 +953,16 @@ fn emit_connection_overload(
     security_events.emit(&event)
 }
 
+fn emit_socket_accept_failure(security_events: &dyn SecurityEventSink) -> Result<(), BrokerError> {
+    security_events.emit(&SecurityEvent::new(
+        SecurityEventKind::SandboxFailure,
+        "socket_accept_failure",
+    ))
+}
+
 fn report_transport_authentication_failure(
     security_events: &dyn SecurityEventSink,
-    failure_gate: &mut TransportAuthenticationFailureGate,
+    failure_gate: &mut FailureWindowGate,
     reason_code: &'static str,
 ) -> Result<(), BrokerError> {
     security_events.emit(&SecurityEvent::new(
@@ -866,6 +970,23 @@ fn report_transport_authentication_failure(
         reason_code,
     ))?;
     if let Some(backoff) = failure_gate.record_failure_at(Instant::now()) {
+        thread::sleep(backoff);
+    }
+    Ok(())
+}
+
+fn report_authenticated_protocol_failure(
+    security_events: &dyn SecurityEventSink,
+    failure_gate: &Mutex<FailureWindowGate>,
+    authenticated_requester: &AuthenticatedRequester,
+    reason_code: &'static str,
+) -> Result<(), BrokerError> {
+    emit_connection_overload(security_events, authenticated_requester, reason_code)?;
+    let backoff = failure_gate
+        .lock()
+        .map_err(|_| BrokerError::new(ErrorCode::Internal, "protocol failure gate is unavailable"))?
+        .record_failure_at(Instant::now());
+    if let Some(backoff) = backoff {
         thread::sleep(backoff);
     }
     Ok(())
@@ -1019,6 +1140,10 @@ fn transport_error(message: &'static str) -> BrokerError {
     BrokerError::new(ErrorCode::InvalidRequest, message)
 }
 
+fn protocol_rejection(reason_code: &'static str) -> ProtocolRejection {
+    ProtocolRejection { reason_code }
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error;
@@ -1065,6 +1190,8 @@ mod tests {
             maximum_queue_wait_milliseconds: 1_000,
             maximum_authentication_failures_per_window: 16,
             authentication_failure_window_milliseconds: 1_000,
+            maximum_protocol_failures_per_window: 16,
+            protocol_failure_window_milliseconds: 1_000,
             read_timeout_milliseconds: 5_000,
             write_timeout_milliseconds: 5_000,
         }
@@ -1102,7 +1229,12 @@ mod tests {
     #[test]
     fn oversized_frame_is_rejected_without_allocating_payload() {
         let mut frame = std::io::Cursor::new(u32::MAX.to_be_bytes());
-        assert!(read_frame(&mut frame).is_err());
+        assert!(matches!(
+            read_frame(&mut frame),
+            Err(ProtocolRejection {
+                reason_code: "request_frame_size_invalid"
+            })
+        ));
     }
 
     #[test]
@@ -1146,7 +1278,31 @@ mod tests {
     #[test]
     fn incomplete_frame_is_rejected() {
         let mut frame = std::io::Cursor::new([0, 0, 0, 4, b'{', b'}']);
-        assert!(read_frame(&mut frame).is_err());
+        assert!(matches!(
+            read_frame(&mut frame),
+            Err(ProtocolRejection {
+                reason_code: "request_frame_incomplete"
+            })
+        ));
+    }
+
+    #[test]
+    fn action_request_decoder_classifies_schema_and_trailing_data() {
+        let invalid = br#"{"protocol_version":1,"hidden_bypass":true}"#;
+        assert!(matches!(
+            decode_action_request(invalid),
+            Err(ProtocolRejection {
+                reason_code: "request_schema_invalid"
+            })
+        ));
+
+        let valid_with_trailing = br#"{"protocol_version":1,"request_id":"00000000-0000-0000-0000-000000000000","requester":{"user_id":"u","agent_id":"a","task_id":"t"},"target":{"type":"local"},"action":{"capability":"ReadFile","arguments":{"path":{"root_id":"r","relative_path":"f"},"maximum_bytes":1}},"approval_token":null}{}"#;
+        assert!(matches!(
+            decode_action_request(valid_with_trailing),
+            Err(ProtocolRejection {
+                reason_code: "request_trailing_data"
+            })
+        ));
     }
 
     #[test]
@@ -1188,17 +1344,19 @@ mod tests {
 
     #[test]
     fn transport_admission_limits_are_required_strict_and_bounded() -> Result<(), Box<dyn Error>> {
-        let valid = br#"{"maximum_open_connections":32,"maximum_open_connections_per_peer":8,"worker_threads":8,"maximum_queued_connections":16,"maximum_queue_wait_milliseconds":1000,"maximum_authentication_failures_per_window":16,"authentication_failure_window_milliseconds":1000,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000}"#;
+        let valid = br#"{"maximum_open_connections":32,"maximum_open_connections_per_peer":8,"worker_threads":8,"maximum_queued_connections":16,"maximum_queue_wait_milliseconds":1000,"maximum_authentication_failures_per_window":16,"authentication_failure_window_milliseconds":1000,"maximum_protocol_failures_per_window":16,"protocol_failure_window_milliseconds":1000,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000}"#;
         let decoded = decode_strict::<TransportLimitsWireConfig>(valid)?;
         validate_transport_limits(&decoded)?;
 
-        let missing_per_peer = br#"{"maximum_open_connections":32,"worker_threads":8,"maximum_queued_connections":16,"maximum_queue_wait_milliseconds":1000,"maximum_authentication_failures_per_window":16,"authentication_failure_window_milliseconds":1000,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000}"#;
+        let missing_per_peer = br#"{"maximum_open_connections":32,"worker_threads":8,"maximum_queued_connections":16,"maximum_queue_wait_milliseconds":1000,"maximum_authentication_failures_per_window":16,"authentication_failure_window_milliseconds":1000,"maximum_protocol_failures_per_window":16,"protocol_failure_window_milliseconds":1000,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000}"#;
         assert!(decode_strict::<TransportLimitsWireConfig>(missing_per_peer).is_err());
-        let missing_queue_wait = br#"{"maximum_open_connections":32,"maximum_open_connections_per_peer":8,"worker_threads":8,"maximum_queued_connections":16,"maximum_authentication_failures_per_window":16,"authentication_failure_window_milliseconds":1000,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000}"#;
+        let missing_queue_wait = br#"{"maximum_open_connections":32,"maximum_open_connections_per_peer":8,"worker_threads":8,"maximum_queued_connections":16,"maximum_authentication_failures_per_window":16,"authentication_failure_window_milliseconds":1000,"maximum_protocol_failures_per_window":16,"protocol_failure_window_milliseconds":1000,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000}"#;
         assert!(decode_strict::<TransportLimitsWireConfig>(missing_queue_wait).is_err());
-        let missing_authentication_window = br#"{"maximum_open_connections":32,"maximum_open_connections_per_peer":8,"worker_threads":8,"maximum_queued_connections":16,"maximum_queue_wait_milliseconds":1000,"maximum_authentication_failures_per_window":16,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000}"#;
+        let missing_authentication_window = br#"{"maximum_open_connections":32,"maximum_open_connections_per_peer":8,"worker_threads":8,"maximum_queued_connections":16,"maximum_queue_wait_milliseconds":1000,"maximum_authentication_failures_per_window":16,"maximum_protocol_failures_per_window":16,"protocol_failure_window_milliseconds":1000,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000}"#;
         assert!(decode_strict::<TransportLimitsWireConfig>(missing_authentication_window).is_err());
-        let bypass = br#"{"maximum_open_connections":32,"maximum_open_connections_per_peer":8,"worker_threads":8,"maximum_queued_connections":16,"maximum_queue_wait_milliseconds":1000,"maximum_authentication_failures_per_window":16,"authentication_failure_window_milliseconds":1000,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000,"unbounded":true}"#;
+        let missing_protocol_window = br#"{"maximum_open_connections":32,"maximum_open_connections_per_peer":8,"worker_threads":8,"maximum_queued_connections":16,"maximum_queue_wait_milliseconds":1000,"maximum_authentication_failures_per_window":16,"authentication_failure_window_milliseconds":1000,"maximum_protocol_failures_per_window":16,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000}"#;
+        assert!(decode_strict::<TransportLimitsWireConfig>(missing_protocol_window).is_err());
+        let bypass = br#"{"maximum_open_connections":32,"maximum_open_connections_per_peer":8,"worker_threads":8,"maximum_queued_connections":16,"maximum_queue_wait_milliseconds":1000,"maximum_authentication_failures_per_window":16,"authentication_failure_window_milliseconds":1000,"maximum_protocol_failures_per_window":16,"protocol_failure_window_milliseconds":1000,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000,"unbounded":true}"#;
         assert!(decode_strict::<TransportLimitsWireConfig>(bypass).is_err());
 
         assert!(validate_transport_limits(&transport_limits(0, 0, 0)).is_err());
@@ -1229,6 +1387,18 @@ mod tests {
         let mut long_authentication_window = transport_limits(8, 4, 4);
         long_authentication_window.authentication_failure_window_milliseconds = 30_001;
         assert!(validate_transport_limits(&long_authentication_window).is_err());
+        let mut no_protocol_failures = transport_limits(8, 4, 4);
+        no_protocol_failures.maximum_protocol_failures_per_window = 0;
+        assert!(validate_transport_limits(&no_protocol_failures).is_err());
+        let mut excessive_protocol_failures = transport_limits(8, 4, 4);
+        excessive_protocol_failures.maximum_protocol_failures_per_window = 1_025;
+        assert!(validate_transport_limits(&excessive_protocol_failures).is_err());
+        let mut short_protocol_window = transport_limits(8, 4, 4);
+        short_protocol_window.protocol_failure_window_milliseconds = 99;
+        assert!(validate_transport_limits(&short_protocol_window).is_err());
+        let mut long_protocol_window = transport_limits(8, 4, 4);
+        long_protocol_window.protocol_failure_window_milliseconds = 30_001;
+        assert!(validate_transport_limits(&long_protocol_window).is_err());
         let mut short_timeout = transport_limits(8, 4, 4);
         short_timeout.read_timeout_milliseconds = 99;
         assert!(validate_transport_limits(&short_timeout).is_err());
@@ -1401,10 +1571,7 @@ mod tests {
 
     #[test]
     fn authentication_failure_gate_backs_off_at_threshold_and_resets() {
-        let limits = transport_limits(8, 4, 4);
-        let mut gate = TransportAuthenticationFailureGate::new(&limits);
-        gate.maximum_failures_per_window = 3;
-        gate.window = Duration::from_secs(1);
+        let mut gate = FailureWindowGate::new(3, Duration::from_secs(1));
         let started_at = gate.window_started_at;
 
         assert_eq!(gate.record_failure_at(started_at), None);
@@ -1428,7 +1595,7 @@ mod tests {
         let sink = RecordingSecurityEventSink {
             events: Mutex::new(Vec::new()),
         };
-        let mut gate = TransportAuthenticationFailureGate::new(&transport_limits(8, 4, 4));
+        let mut gate = FailureWindowGate::new(16, Duration::from_secs(1));
         report_transport_authentication_failure(&sink, &mut gate, "unauthorized_platform_peer")?;
 
         let events = sink.events.lock().map_err(|_| "event lock")?;
@@ -1444,7 +1611,7 @@ mod tests {
 
     #[test]
     fn transport_authentication_failure_stops_when_event_fails() {
-        let mut gate = TransportAuthenticationFailureGate::new(&transport_limits(8, 4, 4));
+        let mut gate = FailureWindowGate::new(16, Duration::from_secs(1));
         assert!(matches!(
             report_transport_authentication_failure(
                 &FailingSecurityEventSink,
@@ -1454,6 +1621,70 @@ mod tests {
             Err(error) if error.code == ErrorCode::SecurityEventFailure
         ));
         assert_eq!(gate.failures_in_window, 0);
+    }
+
+    #[test]
+    fn authenticated_protocol_failure_is_bounded_and_identity_scoped() -> Result<(), Box<dyn Error>>
+    {
+        let sink = RecordingSecurityEventSink {
+            events: Mutex::new(Vec::new()),
+        };
+        let gate = Mutex::new(FailureWindowGate::new(2, Duration::from_millis(100)));
+        let requester = AuthenticatedRequester {
+            user_id: "user-7".to_owned(),
+            agent_id: "agent-3".to_owned(),
+        };
+
+        report_authenticated_protocol_failure(&sink, &gate, &requester, "request_schema_invalid")?;
+        let events = sink.events.lock().map_err(|_| "event lock")?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, SecurityEventKind::ResourceAbusePattern);
+        assert_eq!(events[0].reason_code, "request_schema_invalid");
+        assert_eq!(events[0].user_id.as_deref(), Some("user-7"));
+        assert_eq!(events[0].agent_id.as_deref(), Some("agent-3"));
+        assert!(events[0].request_id.is_none());
+        drop(events);
+        assert_eq!(gate.lock().map_err(|_| "gate lock")?.failures_in_window, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn authenticated_protocol_failure_stops_when_event_fails() {
+        let gate = Mutex::new(FailureWindowGate::new(2, Duration::from_secs(1)));
+        let requester = AuthenticatedRequester {
+            user_id: "user-7".to_owned(),
+            agent_id: "agent-3".to_owned(),
+        };
+        assert!(matches!(
+            report_authenticated_protocol_failure(
+                &FailingSecurityEventSink,
+                &gate,
+                &requester,
+                "request_frame_size_invalid",
+            ),
+            Err(error) if error.code == ErrorCode::SecurityEventFailure
+        ));
+        assert_eq!(
+            gate.lock()
+                .map_or(usize::MAX, |state| state.failures_in_window),
+            0
+        );
+    }
+
+    #[test]
+    fn socket_accept_failure_emits_secret_free_sandbox_event() -> Result<(), Box<dyn Error>> {
+        let sink = RecordingSecurityEventSink {
+            events: Mutex::new(Vec::new()),
+        };
+        emit_socket_accept_failure(&sink)?;
+        let events = sink.events.lock().map_err(|_| "event lock")?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, SecurityEventKind::SandboxFailure);
+        assert_eq!(events[0].reason_code, "socket_accept_failure");
+        assert!(events[0].request_id.is_none());
+        assert!(events[0].user_id.is_none());
+        assert!(events[0].target_digest.is_none());
+        Ok(())
     }
 
     #[test]

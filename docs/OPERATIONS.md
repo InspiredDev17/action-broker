@@ -129,6 +129,8 @@ fields:
     "maximum_queue_wait_milliseconds": 1000,
     "maximum_authentication_failures_per_window": 16,
     "authentication_failure_window_milliseconds": 1000,
+    "maximum_protocol_failures_per_window": 16,
+    "protocol_failure_window_milliseconds": 1000,
     "read_timeout_milliseconds": 5000,
     "write_timeout_milliseconds": 5000
   },
@@ -179,14 +181,16 @@ the fixed worker count must be 1 through 64 and no greater than the global
 maximum. The queue capacity must be 1 through the configured global connection
 maximum. Queue residence, read, and write timeouts must each be 100 through
 30,000 milliseconds. The authentication-failure threshold must be 1 through
-1,024 and its window must be 100 through 30,000 milliseconds. These are
-startup-validated administrative bounds, not caller-controlled hints.
+1,024 and its window must be 100 through 30,000 milliseconds. The authenticated
+protocol-failure threshold and window have the same bounds. These are
+startup-validated administrative limits, not caller-controlled hints.
 Connection admission increments global and per-peer counts in one critical
 section and releases both through an owned permit.
 Capacity saturation or queue expiry closes the socket without parsing a request
 and emits an Agent Green resource-abuse event. The accept loop fails closed when
 it cannot durably record its saturation event; a worker that cannot record a
-queue-expiry event stops instead of processing the expired socket.
+queue-expiry event marks the pool unhealthy instead of processing the expired
+socket, causing the listener health poll to terminate the daemon.
 
 Missing peer credentials and unconfigured peer UIDs also close before parsing
 and durably emit `permission_bypass_attempt` without logging the numeric UID or
@@ -197,6 +201,19 @@ local authentication flood. An event-spool failure stops the daemon rather than
 accepting an unaudited peer. Keep socket group membership narrow and alert on
 both reason codes: `peer_credentials_unavailable` and
 `unauthorized_platform_peer`.
+
+After identity binding, malformed protocol input is reported with one of:
+`request_frame_prefix_incomplete`, `request_frame_size_invalid`,
+`request_frame_incomplete`, `request_schema_invalid`, or
+`request_trailing_data`. These events include only the configured user/agent
+identity and the fixed reason code—never frame bytes. The failure window is
+shared across connection workers. At its threshold the rejecting worker waits
+for the remainder of the window; no malformed request advances to policy or an
+executor. A mandatory event failure marks the worker pool unhealthy; the
+nonblocking listener health poll terminates the daemon within 10 milliseconds.
+A fatal listener accept error emits `sandbox_failure` with reason
+`socket_accept_failure` and terminates. Treat any such shutdown as a service
+health failure requiring storage or socket repair before restart.
 
 For the first audit segment, omit `audit_initial_previous_hash` to use the
 all-zero genesis. For every rotated segment, set it to the exact final

@@ -95,7 +95,7 @@ The broker emits structured Agent Green events for at least:
 | `secret_access_attempt` | Target matches protected credential or secret policy |
 | `forbidden_executable` | Program absent from registry or executable identity/arguments violate policy |
 | `forbidden_destination` | Scheme, host, IP, port, redirect, localhost/private/metadata target violates policy |
-| `resource_abuse_pattern` | Connection, output, time, concurrency, process, CPU, memory, or file limit abuse |
+| `resource_abuse_pattern` | Malformed protocol frames, connection, output, time, concurrency, process, CPU, memory, or file limit abuse |
 | `sandbox_failure` | Required isolation/control could not be established or failed during execution |
 | `unexpected_privilege_elevation` | Effective privilege exceeds the validated execution profile |
 
@@ -153,6 +153,14 @@ loop after its threshold, bounding event growth without silently accepting or
 sampling an already accepted authentication failure. This deliberately permits
 a member of the local IPC group to delay service; narrow group membership and
 host-level connection controls remain part of the availability boundary.
+Authenticated malformed, truncated, oversized, schema-invalid, and trailing
+frame data are classified without retaining their bytes and recorded with the
+bound principal. A worker-shared failure-window breaker bounds rejection rate.
+Failures that occur only while returning an already computed response are not
+misclassified as malicious request input.
+Mandatory event failure marks the fixed worker pool unhealthy and the listener
+terminates rather than continuing with reduced monitoring. Fatal accept errors
+also emit a secret-free `sandbox_failure` before daemon shutdown.
 The broker enforces bounded global, per-principal, and per-capability in-flight
 counts. Admission waits are bounded and cancellation-aware. It does not provide
 weighted fairness, persistent queues, or per-principal scheduling guarantees;

@@ -93,6 +93,20 @@ the rest of a configured time window after a configured number of failures.
 Every socket accepted before that pause receives its event; failures are not
 silently sampled or converted into identity claims.
 
+After peer authentication, the frame reader classifies incomplete prefixes,
+invalid frame sizes, incomplete payloads, invalid request schemas, and trailing
+bytes before authorization. Each rejection closes the socket and emits a
+principal-scoped, content-free `resource_abuse_pattern`. A worker-shared failure
+window bounds event growth and worker churn. Response-write failures after a
+broker result and disconnect-driven cancellation are transport outcomes, not
+automatically labeled as hostile protocol input.
+
+The listener uses a bounded nonblocking health poll. A worker that cannot emit a
+mandatory queue/protocol event marks the entire pool unhealthy; the listener
+detects that state within the poll interval and terminates the daemon. A fatal
+socket-accept error emits `sandbox_failure` before shutdown. The broker does not
+continue accepting actions with a partially disabled Agent Green path.
+
 The daemon fails closed on platforms where this implementation cannot obtain a
 supported peer UID. A future macOS transport must provide an equally explicit,
 tested principal binding before `serve` is enabled there.
