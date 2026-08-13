@@ -139,6 +139,7 @@ readonly event_path="$state_dir/agent-green.jsonl"
 readonly daemon_log="$test_root/daemon.log"
 readonly hold_marker="$control_dir/hold-ready"
 readonly command_request="$control_dir/command-request.json"
+readonly tampered_command_request="$control_dir/tampered-command-request.json"
 readonly normalized_command_request="$test_root/normalized-command-request.json"
 readonly command_request_id='018f47d2-60d2-7af0-bc35-2a1f7f5a6d02'
 
@@ -351,6 +352,27 @@ setpriv --reuid "$platform_uid" --regid "$ipc_gid" --clear-groups \
   --mode normalize-request --request "$command_request" \
   >"$normalized_command_request"
 "$bin_dir/issue-lifecycle-approval" verify "$normalized_command_request"
+jq '.action.arguments.arguments[0] = "29"' "$command_request" >"$tampered_command_request"
+chown "$platform_uid:$ipc_gid" "$tampered_command_request"
+chmod 0600 "$tampered_command_request"
+if "$bin_dir/issue-lifecycle-approval" verify "$tampered_command_request" 2>/dev/null; then
+  fail 'fixture verifier accepted arguments that do not match the signed approval'
+fi
+setpriv --reuid "$platform_uid" --regid "$ipc_gid" --clear-groups \
+  env -i "$bin_dir/lifecycletestclient" \
+  --mode execute-and-expect-approval-invalid --socket "$socket_path" --broker-uid "$broker_uid" \
+  --request "$tampered_command_request" --timeout 5s
+if pgrep -u "$broker_uid" -x sleep >/dev/null 2>&1; then
+  fail 'approval-tampered request started a sandboxed command'
+fi
+jq -e -s --arg request_id "$command_request_id" '
+  any(.[]; .kind == "approval_tampering" and .request_id == $request_id and
+    .reason_code == "approval_invalid" and .user_id == "lifecycle-user" and
+    .agent_id == "lifecycle-agent" and .task_id == "lifecycle-command-cancellation" and
+    .capability == "ExecuteApprovedCommand" and (.target_digest | length == 64))
+' "$event_path" >/dev/null
+audit_summary=$("$bin_dir/action-brokerd" verify-audit --path "$audit_path")
+jq -e '.record_count == 2 and (.head_sha256 | length == 64)' <<<"$audit_summary" >/dev/null
 if pgrep -u "$broker_uid" -x sleep >/dev/null 2>&1; then
   fail 'broker test UID already owns a sleep process'
 fi

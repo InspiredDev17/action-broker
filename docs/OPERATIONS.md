@@ -291,10 +291,14 @@ verifies a typed read allow path, an
 unconfigured same-IPC-group UID deny path and Agent Green event, an in-flight
 partial-frame first-signal drain, exact socket cleanup, the audit chain, and a
 restart using the same durable files. It also issues a short-lived, exact-scope
-test approval through the repository's Rust/JCS model, starts a sandboxed
-approved command, sends `SIGTERM`, requires a broker-confirmed cancelled result,
-and proves no process under the broker test UID survives. After reopening the
-same SQLite ledger, it resubmits that exact token and requires a
+test approval through the repository's Rust/JCS model. First it changes the
+signed command argument without changing the token, requires a broker-confirmed
+`approval_invalid` rejection and Agent Green evidence, and proves no audit start
+or process launch occurred. The original token must then still authorize the
+exact command, proving the failed binding check did not consume its nonce. The
+harness sends `SIGTERM`, requires a broker-confirmed cancelled result, and proves
+no process under the broker test UID survives. After reopening the same SQLite
+ledger, it resubmits that exact token and requires a
 broker-confirmed `approval_replayed` rejection, no second command or audit
 start, and mandatory Agent Green identity/capability evidence. The embedded
 fixture signing key must never appear in production trust configuration; its

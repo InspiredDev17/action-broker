@@ -27,7 +27,7 @@ func main() {
 }
 
 func run() error {
-	mode := flag.String("mode", "read", "probe mode: read, execute-and-expect-cancel, execute-and-expect-replay, or hold-incomplete-frame")
+	mode := flag.String("mode", "read", "probe mode: read, execute-and-expect-approval-invalid, execute-and-expect-cancel, execute-and-expect-replay, or hold-incomplete-frame")
 	socketPath := flag.String("socket", "", "absolute broker Unix-socket path")
 	brokerUID := flag.Uint64("broker-uid", 0, "expected unprivileged broker UID")
 	rootID := flag.String("root-id", "lifecycle", "broker filesystem root ID")
@@ -48,10 +48,12 @@ func run() error {
 	switch *mode {
 	case "read":
 		return readProbe(*socketPath, uint32(*brokerUID), *rootID, *relativePath, *expectedContent, *timeout)
+	case "execute-and-expect-approval-invalid":
+		return executeAndExpectBrokerError(*socketPath, uint32(*brokerUID), *requestPath, *timeout, actionbroker.StatusRejected, "approval_invalid")
 	case "execute-and-expect-cancel":
-		return executeAndExpectCancel(*socketPath, uint32(*brokerUID), *requestPath, *timeout)
+		return executeAndExpectBrokerError(*socketPath, uint32(*brokerUID), *requestPath, *timeout, actionbroker.StatusCancelled, "cancelled")
 	case "execute-and-expect-replay":
-		return executeAndExpectReplay(*socketPath, uint32(*brokerUID), *requestPath, *timeout)
+		return executeAndExpectBrokerError(*socketPath, uint32(*brokerUID), *requestPath, *timeout, actionbroker.StatusRejected, "approval_replayed")
 	case "hold-incomplete-frame":
 		return holdIncompleteFrame(*socketPath, *markerPath, *timeout)
 	default:
@@ -59,34 +61,14 @@ func run() error {
 	}
 }
 
-func executeAndExpectReplay(socketPath string, brokerUID uint32, requestPath string, timeout time.Duration) error {
-	request, err := readRequest(requestPath)
-	if err != nil {
-		return err
-	}
-	client, err := actionbroker.NewClient(
-		socketPath,
-		brokerUID,
-		actionbroker.WithTransportTimeout(timeout),
-	)
-	if err != nil {
-		return fmt.Errorf("construct client: %w", err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	response, executeErr := client.Execute(ctx, request)
-	if executeErr == nil {
-		return errors.New("replayed approval unexpectedly reached execution")
-	}
-	var brokerError *actionbroker.BrokerError
-	if !errors.As(executeErr, &brokerError) || response == nil ||
-		brokerError.Status != actionbroker.StatusRejected || brokerError.Code != "approval_replayed" {
-		return fmt.Errorf("replayed approval did not return broker-confirmed rejection: %w", executeErr)
-	}
-	return nil
-}
-
-func executeAndExpectCancel(socketPath string, brokerUID uint32, requestPath string, timeout time.Duration) error {
+func executeAndExpectBrokerError(
+	socketPath string,
+	brokerUID uint32,
+	requestPath string,
+	timeout time.Duration,
+	expectedStatus actionbroker.ActionStatus,
+	expectedCode string,
+) error {
 	request, err := readRequest(requestPath)
 	if err != nil {
 		return err
@@ -104,15 +86,20 @@ func executeAndExpectCancel(socketPath string, brokerUID uint32, requestPath str
 	response, executeErr := client.Execute(ctx, request)
 	if executeErr == nil {
 		return fmt.Errorf(
-			"approved command unexpectedly completed instead of being cancelled: status=%s output=%#v",
+			"request unexpectedly succeeded: status=%s output=%#v",
 			response.Status,
 			response.Output.Result(),
 		)
 	}
 	var brokerError *actionbroker.BrokerError
 	if !errors.As(executeErr, &brokerError) || response == nil ||
-		brokerError.Status != actionbroker.StatusCancelled || brokerError.Code != "cancelled" {
-		return fmt.Errorf("approved command did not return broker-confirmed cancellation: %w", executeErr)
+		brokerError.Status != expectedStatus || brokerError.Code != expectedCode {
+		return fmt.Errorf(
+			"request did not return broker-confirmed %s/%s: %w",
+			expectedStatus,
+			expectedCode,
+			executeErr,
+		)
 	}
 	return nil
 }
