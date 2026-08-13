@@ -375,9 +375,24 @@ jq -e -s --arg request_id "$command_request_id" '
     .event.error_code == "cancelled")
 ' "$audit_path" >/dev/null
 
-# Continue transport coverage in a fresh daemon after approved-command
-# cancellation has durably completed.
+# Reopen the durable replay ledger, submit the exact consumed token again, and
+# require a broker-confirmed denial before any second command or audit start.
 start_daemon
+setpriv --reuid "$platform_uid" --regid "$ipc_gid" --clear-groups \
+  env -i "$bin_dir/lifecycletestclient" \
+  --mode execute-and-expect-replay --socket "$socket_path" --broker-uid "$broker_uid" \
+  --request "$command_request" --timeout 5s
+if pgrep -u "$broker_uid" -x sleep >/dev/null 2>&1; then
+  fail 'replayed approval started a sandboxed command'
+fi
+jq -e -s --arg request_id "$command_request_id" '
+  any(.[]; .kind == "replayed_approval" and .request_id == $request_id and
+    .reason_code == "approval_replayed" and .user_id == "lifecycle-user" and
+    .agent_id == "lifecycle-agent" and .task_id == "lifecycle-command-cancellation" and
+    .capability == "ExecuteApprovedCommand" and (.target_digest | length == 64))
+' "$event_path" >/dev/null
+audit_summary=$("$bin_dir/action-brokerd" verify-audit --path "$audit_path")
+jq -e '.record_count == 4 and (.head_sha256 | length == 64)' <<<"$audit_summary" >/dev/null
 
 # Hold one authenticated worker in the real framed-read path, then request a
 # first-signal shutdown. The configured read deadline is shorter than the drain

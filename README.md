@@ -180,8 +180,9 @@ The harness establishes distinct numeric broker, Platform, unauthorized-peer,
 and IPC-group identities. It passes only after a typed policy-only read,
 mandatory unauthorized-peer evidence, an interrupted partial-frame drain,
 signed approved-command cancellation with no surviving child, socket cleanup,
-audit-chain verification, and clean restarts against the same durable state. The
-issuer is excluded from normal builds behind the explicit
+post-restart rejection of the consumed approval, mandatory replay evidence,
+audit-chain verification, and clean restarts against the same durable state.
+The issuer is excluded from normal builds behind the explicit
 `lifecycle-test-fixture` feature and embeds a test key that must never be trusted
 by a production broker. The harness requires Linux, root for creating
 disposable identities, and the tools it checks at startup. Unsupported hosts

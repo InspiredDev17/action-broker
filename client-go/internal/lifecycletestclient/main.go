@@ -27,7 +27,7 @@ func main() {
 }
 
 func run() error {
-	mode := flag.String("mode", "read", "probe mode: read, execute-and-expect-cancel, or hold-incomplete-frame")
+	mode := flag.String("mode", "read", "probe mode: read, execute-and-expect-cancel, execute-and-expect-replay, or hold-incomplete-frame")
 	socketPath := flag.String("socket", "", "absolute broker Unix-socket path")
 	brokerUID := flag.Uint64("broker-uid", 0, "expected unprivileged broker UID")
 	rootID := flag.String("root-id", "lifecycle", "broker filesystem root ID")
@@ -50,11 +50,40 @@ func run() error {
 		return readProbe(*socketPath, uint32(*brokerUID), *rootID, *relativePath, *expectedContent, *timeout)
 	case "execute-and-expect-cancel":
 		return executeAndExpectCancel(*socketPath, uint32(*brokerUID), *requestPath, *timeout)
+	case "execute-and-expect-replay":
+		return executeAndExpectReplay(*socketPath, uint32(*brokerUID), *requestPath, *timeout)
 	case "hold-incomplete-frame":
 		return holdIncompleteFrame(*socketPath, *markerPath, *timeout)
 	default:
 		return fmt.Errorf("unsupported mode %q", *mode)
 	}
+}
+
+func executeAndExpectReplay(socketPath string, brokerUID uint32, requestPath string, timeout time.Duration) error {
+	request, err := readRequest(requestPath)
+	if err != nil {
+		return err
+	}
+	client, err := actionbroker.NewClient(
+		socketPath,
+		brokerUID,
+		actionbroker.WithTransportTimeout(timeout),
+	)
+	if err != nil {
+		return fmt.Errorf("construct client: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	response, executeErr := client.Execute(ctx, request)
+	if executeErr == nil {
+		return errors.New("replayed approval unexpectedly reached execution")
+	}
+	var brokerError *actionbroker.BrokerError
+	if !errors.As(executeErr, &brokerError) || response == nil ||
+		brokerError.Status != actionbroker.StatusRejected || brokerError.Code != "approval_replayed" {
+		return fmt.Errorf("replayed approval did not return broker-confirmed rejection: %w", executeErr)
+	}
+	return nil
 }
 
 func executeAndExpectCancel(socketPath string, brokerUID uint32, requestPath string, timeout time.Duration) error {

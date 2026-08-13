@@ -293,12 +293,15 @@ partial-frame first-signal drain, exact socket cleanup, the audit chain, and a
 restart using the same durable files. It also issues a short-lived, exact-scope
 test approval through the repository's Rust/JCS model, starts a sandboxed
 approved command, sends `SIGTERM`, requires a broker-confirmed cancelled result,
-and proves no process under the broker test UID survives. The embedded fixture
-signing key must never appear in production trust configuration; its binary is
-excluded from normal builds unless `lifecycle-test-fixture` is explicitly
-enabled. A pass qualifies this narrow lifecycle on the tested Linux host only;
-it does not attest cgroups, seccomp, general command containment, external
-effects, or the production service-manager profile.
+and proves no process under the broker test UID survives. After reopening the
+same SQLite ledger, it resubmits that exact token and requires a
+broker-confirmed `approval_replayed` rejection, no second command or audit
+start, and mandatory Agent Green identity/capability evidence. The embedded
+fixture signing key must never appear in production trust configuration; its
+binary is excluded from normal builds unless `lifecycle-test-fixture` is
+explicitly enabled. A pass qualifies this narrow lifecycle on the tested Linux
+host only; it does not attest cgroups, seccomp, general command containment,
+external effects, or the production service-manager profile.
 
 Containerized qualification requires an outer runner that permits unprivileged
 user namespaces and their private mounts. If the container runtime blocks
