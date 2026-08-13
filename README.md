@@ -161,6 +161,26 @@ cargo test --workspace
 go -C client-go test ./...
 ```
 
+The Linux lifecycle qualification is intentionally separate from portable unit
+tests. On a disposable Linux host, build the shipped daemon and internal Go
+transport probe, then run the root-only fixture:
+
+```text
+cargo build --locked --release -p action-brokerd
+go -C client-go build -trimpath -o ../target/lifecycletestclient ./internal/lifecycletestclient
+sudo tests/linux-service-lifecycle.sh \
+  --daemon "$PWD/target/release/action-brokerd" \
+  --client "$PWD/target/lifecycletestclient"
+```
+
+The harness establishes distinct numeric broker, Platform, unauthorized-peer,
+and IPC-group identities. It passes only after a typed policy-only read,
+mandatory unauthorized-peer evidence, an interrupted partial-frame drain,
+socket cleanup, audit-chain verification, and a clean restart against the same
+durable state. It requires Linux, root for creating disposable identities, and
+the tools it checks at startup. Unsupported hosts exit with status 77 rather
+than manufacturing platform evidence. CI runs the same script on Ubuntu.
+
 Treat successful unit tests as source-level evidence, not proof that a
 particular deployed host provides every desired sandbox primitive. Before
 operation, configure explicit roots, executable and network allowlists, approval

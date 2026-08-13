@@ -282,6 +282,18 @@ Do not label a profile “isolated” solely because one rlimit or `no_new_privs
 active. Aggregate descendant containment and network isolation require the
 corresponding kernel/service-manager controls.
 
+Before host qualification, run `tests/linux-service-lifecycle.sh` with absolute
+paths to release builds of `action-brokerd` and the internal lifecycle client,
+as documented in the README. The harness uses root only to construct isolated
+numeric identities, then runs the daemon
+under a distinct unprivileged UID with empty supplementary groups, zero active
+capabilities, and `NoNewPrivs`. It verifies a typed read allow path, an
+unconfigured same-IPC-group UID deny path and Agent Green event, an in-flight
+partial-frame first-signal drain, exact socket cleanup, the audit chain, and a
+restart using the same durable files. A pass qualifies this narrow lifecycle on
+the tested Linux host or CI runner only; it does not attest cgroups, seccomp,
+command execution, external effects, or the production service-manager profile.
+
 ### macOS
 
 The current daemon deliberately refuses all peers on macOS because a supported
