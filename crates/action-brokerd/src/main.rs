@@ -28,6 +28,7 @@ use action_broker_core::model::{
 use action_broker_core::model::{ActionRequest, ActionResponse};
 use action_broker_core::network::{NetworkPolicyConfig, SecureHttpClient};
 use action_broker_core::policy::{DeterministicPolicy, PolicyConfig};
+use action_broker_core::privilege::{RuntimePrivilegeMonitor, RuntimePrivilegeProfileConfig};
 use action_broker_core::process::{ProcessInspectExecutor, ProcessInspectPolicyConfig};
 use action_broker_core::security_event::JsonlSecurityEventSink;
 use clap::{Parser, Subcommand};
@@ -89,6 +90,7 @@ struct DaemonConfig {
     socket_path: PathBuf,
     socket_group_id: u32,
     platform_peers: Vec<PlatformPeerConfig>,
+    privilege_profile: RuntimePrivilegeProfileConfig,
     replay_database_path: PathBuf,
     replay_ledger: ReplayLedgerConfig,
     audit_log_path: PathBuf,
@@ -211,9 +213,11 @@ fn print_capabilities() -> Result<(), BrokerError> {
 fn serve(config_path: &Path) -> Result<(), BrokerError> {
     refuse_root()?;
     let config = read_secure_json::<DaemonConfig>(config_path, MAX_CONFIG_BYTES, "configuration")?;
+    let privilege_monitor = RuntimePrivilegeMonitor::from_config(config.privilege_profile.clone())?;
+    privilege_monitor.verify()?;
     let peer_principals = validate_platform_peers(&config.platform_peers)?;
     validate_state_paths(&config)?;
-    let broker = Arc::new(build_broker(&config)?);
+    let broker = Arc::new(build_broker(&config, privilege_monitor)?);
     let listener = bind_socket(&config.socket_path, config.socket_group_id)?;
     let open_connections = Arc::new(AtomicUsize::new(0));
     for incoming in listener.incoming() {
@@ -243,7 +247,10 @@ fn serve(config_path: &Path) -> Result<(), BrokerError> {
     ))
 }
 
-fn build_broker(config: &DaemonConfig) -> Result<ActionBroker, BrokerError> {
+fn build_broker(
+    config: &DaemonConfig,
+    privilege_monitor: RuntimePrivilegeMonitor,
+) -> Result<ActionBroker, BrokerError> {
     let mut trusted_keys = TrustedKeyRegistry::new();
     if config.approval_keys.is_empty() {
         return Err(BrokerError::invalid(
@@ -312,6 +319,7 @@ fn build_broker(config: &DaemonConfig) -> Result<ActionBroker, BrokerError> {
         process_inspection,
         audit,
         security_events,
+        privilege_monitor,
         BrokerLimits {
             maximum_concurrent_actions: config.broker_limits.maximum_concurrent_actions,
             maximum_concurrent_actions_per_principal: config
@@ -776,6 +784,24 @@ mod tests {
         assert!(decode_strict::<ReplayLedgerConfig>(missing_retention).is_err());
         let bypass = br#"{"maximum_entries":1000000,"retention_after_expiration_seconds":86400,"bypass":true}"#;
         assert!(decode_strict::<ReplayLedgerConfig>(bypass).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_privilege_profile_is_required_and_strict() -> Result<(), Box<dyn Error>> {
+        let valid = br#"{"expected_user_id":1001,"expected_group_id":1001,"allowed_supplementary_group_ids":[1001,2001]}"#;
+        let decoded = decode_strict::<RuntimePrivilegeProfileConfig>(valid)?;
+        assert_eq!(decoded.expected_user_id, 1001);
+        assert_eq!(decoded.expected_group_id, 1001);
+        assert_eq!(
+            decoded.allowed_supplementary_group_ids,
+            std::collections::BTreeSet::from([1001, 2001])
+        );
+
+        let missing_group = br#"{"expected_user_id":1001,"allowed_supplementary_group_ids":[]}"#;
+        assert!(decode_strict::<RuntimePrivilegeProfileConfig>(missing_group).is_err());
+        let bypass = br#"{"expected_user_id":1001,"expected_group_id":1001,"allowed_supplementary_group_ids":[],"ignore_capabilities":true}"#;
+        assert!(decode_strict::<RuntimePrivilegeProfileConfig>(bypass).is_err());
         Ok(())
     }
 

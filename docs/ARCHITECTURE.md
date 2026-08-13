@@ -89,6 +89,13 @@ approval verification, replay prevention, audit records, Agent Green events,
 and executor dispatch. Security-sensitive behavior remains in Rust. Unsafe Rust
 is denied by workspace lint policy.
 
+On Linux, daemon readiness and every action authenticate a bounded
+`/proc/<pid>/task/<tid>/status` handle as procfs and verify the configured
+unprivileged real/effective/saved/fs user and group IDs, the exact supplementary
+group set, zero inheritable/permitted/effective/ambient capability masks, and
+`NoNewPrivs: 1`. Any mismatch denies execution; the request schema has no
+privilege-check override.
+
 ### Executors
 
 The initial local executor surface is intentionally narrow:

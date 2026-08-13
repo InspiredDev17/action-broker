@@ -21,6 +21,7 @@ regardless of representation, production configuration must provide:
 | Area | Required state |
 | --- | --- |
 | Identity | distinct unprivileged broker UID and Platform UID; exact Platform UID -> user/agent mapping |
+| Broker privilege | expected non-root UID/GID, exact supplementary GIDs, empty active capability sets, `NoNewPrivileges=true` |
 | Socket | absolute path, broker-owned setgid directory, Platform access group, `0660` socket, frame/request bounds |
 | Approval trust | accepted token/schema versions, unique Ed25519 public-key IDs, required activation, optional retirement/revocation cutoffs, max lifetime and clock skew |
 | Replay | dedicated durable ledger path, permissions, full synchronization, maximum rows, post-expiration retention |
@@ -75,8 +76,9 @@ the expected distinct broker UID and verifies stable endpoint ownership.
 Startup should fail before accepting requests unless all configured mandatory
 controls pass:
 
-1. the effective UID is the configured unprivileged broker identity and no
-   unexpected privilege/capability is present;
+1. all real/effective/saved/fs IDs and supplementary groups match the configured
+   unprivileged broker profile, active Linux capability masks are zero, and
+   `NoNewPrivs` is enabled;
 2. configuration ownership, mode, schema, and cross-references are valid;
 3. every enabled filesystem root opens to the expected object and is not a
    prohibited secret/pseudo-filesystem target;
@@ -109,6 +111,11 @@ fields:
     "maximum_entries": 1000000,
     "retention_after_expiration_seconds": 86400
   },
+  "privilege_profile": {
+    "expected_user_id": 1001,
+    "expected_group_id": 1001,
+    "allowed_supplementary_group_ids": [1001, 2001]
+  },
   "process_inspection": {
     "enabled": false,
     "allowed_user_ids": [],
@@ -135,6 +142,18 @@ unexpired rows. The ledger persists its last observed wall time. If the clock
 moves backward, approval consumption remains disabled until operators verify
 time integrity and reconcile replay state; do not edit the high-water mark as a
 shortcut.
+
+`privilege_profile` is required and must exactly describe the dedicated broker
+account. UID 0, GID 0, group 0, and more than 16 supplementary groups are
+rejected. Configure the service manager with `NoNewPrivileges=true`, a fixed
+`User=` and `Group=`, and only the explicitly listed `SupplementaryGroups=`.
+The profile is checked at readiness and again on each request thread. All four
+kernel UID and GID slots must match, every listed supplementary GID must match
+exactly, and the inheritable, permitted, effective, and ambient Linux capability
+masks must be zero. A readiness mismatch stops startup before the socket is
+bound; a mismatch detected during an action denies it and emits an Agent Green
+`unexpected_privilege_elevation` event. The check verifies the opened status
+file is procfs and never trusts an environment variable or caller field.
 
 `process_inspection` may be omitted only to select the same disabled default.
 Enabling it requires at least one UID, forbids UID 0, and never authorizes more

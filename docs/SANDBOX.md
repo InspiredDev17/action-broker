@@ -260,12 +260,16 @@ controls cause a denial before side effects. A failure after launch triggers
 bounded termination, a finalized audit record, and an Agent Green
 `sandbox_failure` event.
 
-An unexpected broker effective UID triggers denial and an
-`unexpected_privilege_elevation` event. The current foundation does not inspect
-Linux capability sets, supplementary groups, macOS entitlements, or post-exec
-child privilege state; program validation rejects setuid/setgid executables and
-the broker is never root. Deployments needing those additional checks must keep
-approved commands disabled until they are implemented and qualified.
+An unexpected broker privilege state triggers denial and an
+`unexpected_privilege_elevation` event. On Linux the broker authenticates the
+current thread's procfs status and verifies real/effective/saved/fs user and
+group IDs, the exact configured supplementary groups, zero
+inheritable/permitted/effective/ambient capability masks, and `NoNewPrivs: 1`
+at readiness and before each action. `NoNewPrivs` is inherited by launchers and
+children, and program validation rejects setuid/setgid executables. The current
+foundation does not inspect macOS entitlements or independently attest
+post-exec child privilege state; deployments needing those guarantees must keep
+affected approved-command profiles disabled until implemented and qualified.
 
 ## Verification expectations
 

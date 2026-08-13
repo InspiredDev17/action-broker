@@ -21,6 +21,7 @@ use crate::model::{
 };
 use crate::network::SecureHttpClient;
 use crate::policy::DeterministicPolicy;
+use crate::privilege::RuntimePrivilegeMonitor;
 use crate::process::ProcessInspectExecutor;
 use crate::security_event::{SecurityEvent, SecurityEventKind, SecurityEventSink};
 
@@ -191,7 +192,7 @@ pub struct ActionBroker {
     audit: Arc<dyn AuditSink>,
     security_events: Arc<dyn SecurityEventSink>,
     concurrency: ConcurrencyGate,
-    expected_effective_uid: u32,
+    privilege_monitor: RuntimePrivilegeMonitor,
 }
 
 /// Identity established by the transport before request JSON is trusted.
@@ -213,6 +214,7 @@ impl ActionBroker {
         process_inspection: ProcessInspectExecutor,
         audit: Arc<dyn AuditSink>,
         security_events: Arc<dyn SecurityEventSink>,
+        privilege_monitor: RuntimePrivilegeMonitor,
         limits: BrokerLimits,
     ) -> BrokerResult<Self> {
         let git = GitReadExecutor::new(Arc::clone(&filesystem));
@@ -227,7 +229,7 @@ impl ActionBroker {
             audit,
             security_events,
             concurrency: ConcurrencyGate::new(limits)?,
-            expected_effective_uid: rustix::process::geteuid().as_raw(),
+            privilege_monitor,
         })
     }
 
@@ -290,10 +292,7 @@ impl ActionBroker {
         cancellation: &CancellationToken,
         started_at: i64,
     ) -> BrokerResult<CapabilityOutput> {
-        if let Err(error) = ensure_expected_effective_uid(
-            self.expected_effective_uid,
-            rustix::process::geteuid().as_raw(),
-        ) {
+        if let Err(error) = self.privilege_monitor.verify() {
             self.emit_for_error(request, &error)?;
             return Err(error);
         }
@@ -710,16 +709,6 @@ fn map_approval_error(error: &ApprovalError) -> BrokerError {
     }
 }
 
-fn ensure_expected_effective_uid(expected: u32, observed: u32) -> BrokerResult<()> {
-    if observed == expected {
-        return Ok(());
-    }
-    Err(BrokerError::new(
-        ErrorCode::UnexpectedPrivilegeElevation,
-        "broker effective user identity changed unexpectedly",
-    ))
-}
-
 const fn status_for_error(code: ErrorCode) -> ActionStatus {
     match code {
         ErrorCode::Timeout => ActionStatus::TimedOut,
@@ -978,16 +967,7 @@ mod tests {
     }
 
     #[test]
-    fn effective_uid_change_is_detected_and_security_relevant() {
-        assert!(ensure_expected_effective_uid(501, 501).is_ok());
-        let result = ensure_expected_effective_uid(501, 0);
-        assert!(matches!(
-            result,
-            Err(BrokerError {
-                code: ErrorCode::UnexpectedPrivilegeElevation,
-                ..
-            })
-        ));
+    fn unexpected_privilege_is_security_relevant() {
         assert_eq!(
             security_event_kind(ErrorCode::UnexpectedPrivilegeElevation),
             Some(SecurityEventKind::UnexpectedPrivilegeElevation)

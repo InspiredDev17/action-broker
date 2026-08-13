@@ -90,7 +90,10 @@ Action Broker is designed to fail closed:
   private ranges, and metadata endpoints;
 - child processes do not inherit the broker environment or its secrets;
 - global, per-principal, and per-capability admission bounds prevent one peer or
-  one capability from consuming every execution slot; and
+  one capability from consuming every execution slot;
+- daemon readiness and every action verify exact real/effective/saved/fs IDs,
+  supplementary groups, empty active Linux capability sets, and inherited
+  `NoNewPrivs`; and
 - security events cannot be disabled by an action request.
 
 The Personal AI Platform and Action Broker must run under different
