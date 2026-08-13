@@ -76,12 +76,14 @@ select a root-configured `{platform UID -> user ID, agent ID}` principal before
 broker policy; requester JSON must match it exactly. The setgid socket directory
 and `0660` socket admit the configured Platform group without making the
 Platform owner of the endpoint. A single locked admission ledger atomically
-enforces global and per-peer connection limits. Admitted sockets enter a bounded
-queue serviced by a fixed number of workers; the daemon never creates one
-connection thread per accepted client. Strictly bounded frame sizes and
-configured read/write timeouts constrain transport abuse. Limit rejection emits
-a secret-free Agent Green `resource_abuse_pattern` event before request JSON is
-parsed. Peer access never substitutes for permission or approval.
+enforces global and per-peer connection limits. Admitted sockets enter an
+explicitly sized queue serviced by a fixed number of workers; the daemon never
+creates one connection thread per accepted client. A worker drops any socket
+whose configured queue-residence deadline has elapsed before it parses request
+bytes. Strictly bounded frame sizes and configured read/write timeouts constrain
+transport abuse. Capacity and queue-age rejection emit a secret-free Agent Green
+`resource_abuse_pattern` event before request JSON is parsed. Peer access never
+substitutes for permission or approval.
 
 The daemon fails closed on platforms where this implementation cannot obtain a
 supported peer UID. A future macOS transport must provide an equally explicit,

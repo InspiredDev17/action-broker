@@ -141,10 +141,11 @@ tests on the actual OS/filesystem/deployment profile.
 Action Broker protects bounded availability, not unlimited service. It caps
 configured open connections at a hard ceiling of 128, applies a separate
 per-peer ceiling, services a bounded queue with at most 64 fixed connection
-workers, bounds frames and socket reads/writes, and limits active actions,
-DNS/redirect work, subprocess output, and audit/event record size. Admission is
-one atomic global/per-peer state transition, so concurrent accepts cannot
-overshoot either bound. Rejected authenticated peers produce mandatory
+workers, rejects sockets whose bounded queue-residence deadline expires, bounds
+frames and socket reads/writes, and limits active actions, DNS/redirect work,
+subprocess output, and audit/event record size. Admission is one atomic
+global/per-peer state transition, so concurrent accepts cannot overshoot either
+bound. Capacity and queue-age rejection of authenticated peers produce mandatory
 secret-free Agent Green resource-abuse events before request parsing.
 The broker enforces bounded global, per-principal, and per-capability in-flight
 counts. Admission waits are bounded and cancellation-aware. It does not provide

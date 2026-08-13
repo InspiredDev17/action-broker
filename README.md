@@ -92,7 +92,8 @@ Action Broker is designed to fail closed:
 - global, per-principal, and per-capability admission bounds prevent one peer or
   one capability from consuming every execution slot;
 - the local transport uses atomic global/per-peer connection admission, a fixed
-  worker set, a bounded socket queue, and configured read/write deadlines;
+  worker set, an explicitly bounded socket queue with a residence deadline, and
+  configured read/write deadlines;
 - daemon readiness and every action verify exact real/effective/saved/fs IDs,
   supplementary groups, empty active Linux capability sets, and inherited
   `NoNewPrivs`; and

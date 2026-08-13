@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use action_broker_core::approval::{
     ApprovalVerifier, ApprovalVerifierConfig, ReplayLedgerConfig, SqliteReplayStore,
@@ -138,6 +138,7 @@ struct ConnectionJob {
     stream: UnixStream,
     authenticated_requester: AuthenticatedRequester,
     connection_permit: ConnectionPermit,
+    accepted_at: Instant,
 }
 
 struct ConnectionWorkerPool {
@@ -148,20 +149,30 @@ struct ConnectionWorkerPool {
 impl ConnectionWorkerPool {
     fn new(
         broker: Arc<ActionBroker>,
+        security_events: Arc<dyn SecurityEventSink>,
         limits: &TransportLimitsWireConfig,
     ) -> Result<Self, BrokerError> {
-        let (sender, receiver) = mpsc::sync_channel(limits.maximum_open_connections);
+        let (sender, receiver) = mpsc::sync_channel(limits.maximum_queued_connections);
         let receiver = Arc::new(Mutex::new(receiver));
+        let maximum_queue_wait = Duration::from_millis(limits.maximum_queue_wait_milliseconds);
         let read_timeout = Duration::from_millis(limits.read_timeout_milliseconds);
         let write_timeout = Duration::from_millis(limits.write_timeout_milliseconds);
         let mut workers = Vec::with_capacity(limits.worker_threads);
         for worker_index in 0..limits.worker_threads {
             let broker = Arc::clone(&broker);
             let receiver = Arc::clone(&receiver);
+            let security_events = Arc::clone(&security_events);
             let worker = thread::Builder::new()
                 .name(format!("action-broker-connection-{worker_index}"))
                 .spawn(move || {
-                    connection_worker(receiver, broker, read_timeout, write_timeout);
+                    connection_worker(
+                        receiver,
+                        broker,
+                        security_events,
+                        maximum_queue_wait,
+                        read_timeout,
+                        write_timeout,
+                    );
                 })
                 .map_err(|_| {
                     BrokerError::new(ErrorCode::Internal, "connection worker could not start")
@@ -182,6 +193,8 @@ impl ConnectionWorkerPool {
 fn connection_worker(
     receiver: Arc<Mutex<Receiver<ConnectionJob>>>,
     broker: Arc<ActionBroker>,
+    security_events: Arc<dyn SecurityEventSink>,
+    maximum_queue_wait: Duration,
     read_timeout: Duration,
     write_timeout: Duration,
 ) {
@@ -199,8 +212,21 @@ fn connection_worker(
             stream,
             authenticated_requester,
             connection_permit,
+            accepted_at,
         } = job;
         let _connection_permit = connection_permit;
+        match reject_expired_connection(
+            security_events.as_ref(),
+            &authenticated_requester,
+            accepted_at.elapsed(),
+            maximum_queue_wait,
+        ) {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(_) => {
+                return;
+            }
+        }
         let _ = handle_connection(
             Arc::clone(&broker),
             authenticated_requester,
@@ -309,6 +335,8 @@ struct TransportLimitsWireConfig {
     maximum_open_connections: usize,
     maximum_open_connections_per_peer: usize,
     worker_threads: usize,
+    maximum_queued_connections: usize,
+    maximum_queue_wait_milliseconds: u64,
     read_timeout_milliseconds: u64,
     write_timeout_milliseconds: u64,
 }
@@ -398,7 +426,11 @@ fn serve(config_path: &Path) -> Result<(), BrokerError> {
         Arc::clone(&security_events),
     )?);
     let admission = ConnectionAdmission::new(&config.transport_limits);
-    let worker_pool = ConnectionWorkerPool::new(Arc::clone(&broker), &config.transport_limits)?;
+    let worker_pool = ConnectionWorkerPool::new(
+        Arc::clone(&broker),
+        Arc::clone(&security_events),
+        &config.transport_limits,
+    )?;
     let listener = bind_socket(&config.socket_path, config.socket_group_id)?;
     for incoming in listener.incoming() {
         let Ok(stream) = incoming else {
@@ -433,6 +465,7 @@ fn serve(config_path: &Path) -> Result<(), BrokerError> {
             stream,
             authenticated_requester,
             connection_permit,
+            accepted_at: Instant::now(),
         };
         match worker_pool.try_submit(job) {
             Ok(()) => {}
@@ -720,6 +753,10 @@ fn validate_transport_limits(limits: &TransportLimitsWireConfig) -> Result<(), B
         || limits.worker_threads == 0
         || limits.worker_threads > MAXIMUM_CONNECTION_WORKERS
         || limits.worker_threads > limits.maximum_open_connections
+        || limits.maximum_queued_connections == 0
+        || limits.maximum_queued_connections > limits.maximum_open_connections
+        || !(MINIMUM_TRANSPORT_TIMEOUT_MILLISECONDS..=MAXIMUM_TRANSPORT_TIMEOUT_MILLISECONDS)
+            .contains(&limits.maximum_queue_wait_milliseconds)
         || !(MINIMUM_TRANSPORT_TIMEOUT_MILLISECONDS..=MAXIMUM_TRANSPORT_TIMEOUT_MILLISECONDS)
             .contains(&limits.read_timeout_milliseconds)
         || !(MINIMUM_TRANSPORT_TIMEOUT_MILLISECONDS..=MAXIMUM_TRANSPORT_TIMEOUT_MILLISECONDS)
@@ -730,6 +767,27 @@ fn validate_transport_limits(limits: &TransportLimitsWireConfig) -> Result<(), B
         ));
     }
     Ok(())
+}
+
+fn connection_queue_expired(elapsed: Duration, maximum_queue_wait: Duration) -> bool {
+    elapsed >= maximum_queue_wait
+}
+
+fn reject_expired_connection(
+    security_events: &dyn SecurityEventSink,
+    authenticated_requester: &AuthenticatedRequester,
+    elapsed: Duration,
+    maximum_queue_wait: Duration,
+) -> Result<bool, BrokerError> {
+    if !connection_queue_expired(elapsed, maximum_queue_wait) {
+        return Ok(false);
+    }
+    emit_connection_overload(
+        security_events,
+        authenticated_requester,
+        "connection_queue_wait_expired",
+    )?;
+    Ok(true)
 }
 
 fn emit_connection_overload(
@@ -903,6 +961,8 @@ mod tests {
         events: Mutex<Vec<SecurityEvent>>,
     }
 
+    struct FailingSecurityEventSink;
+
     impl SecurityEventSink for RecordingSecurityEventSink {
         fn emit(&self, event: &SecurityEvent) -> Result<(), BrokerError> {
             self.events
@@ -910,6 +970,15 @@ mod tests {
                 .map_err(|_| BrokerError::new(ErrorCode::Internal, "test event lock failed"))?
                 .push(event.clone());
             Ok(())
+        }
+    }
+
+    impl SecurityEventSink for FailingSecurityEventSink {
+        fn emit(&self, _event: &SecurityEvent) -> Result<(), BrokerError> {
+            Err(BrokerError::new(
+                ErrorCode::SecurityEventFailure,
+                "test security event failure",
+            ))
         }
     }
 
@@ -922,6 +991,8 @@ mod tests {
             maximum_open_connections,
             maximum_open_connections_per_peer,
             worker_threads,
+            maximum_queued_connections: maximum_open_connections,
+            maximum_queue_wait_milliseconds: 1_000,
             read_timeout_milliseconds: 5_000,
             write_timeout_milliseconds: 5_000,
         }
@@ -1045,19 +1116,33 @@ mod tests {
 
     #[test]
     fn transport_admission_limits_are_required_strict_and_bounded() -> Result<(), Box<dyn Error>> {
-        let valid = br#"{"maximum_open_connections":32,"maximum_open_connections_per_peer":8,"worker_threads":8,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000}"#;
+        let valid = br#"{"maximum_open_connections":32,"maximum_open_connections_per_peer":8,"worker_threads":8,"maximum_queued_connections":16,"maximum_queue_wait_milliseconds":1000,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000}"#;
         let decoded = decode_strict::<TransportLimitsWireConfig>(valid)?;
         validate_transport_limits(&decoded)?;
 
-        let missing_per_peer = br#"{"maximum_open_connections":32,"worker_threads":8,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000}"#;
+        let missing_per_peer = br#"{"maximum_open_connections":32,"worker_threads":8,"maximum_queued_connections":16,"maximum_queue_wait_milliseconds":1000,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000}"#;
         assert!(decode_strict::<TransportLimitsWireConfig>(missing_per_peer).is_err());
-        let bypass = br#"{"maximum_open_connections":32,"maximum_open_connections_per_peer":8,"worker_threads":8,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000,"unbounded":true}"#;
+        let missing_queue_wait = br#"{"maximum_open_connections":32,"maximum_open_connections_per_peer":8,"worker_threads":8,"maximum_queued_connections":16,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000}"#;
+        assert!(decode_strict::<TransportLimitsWireConfig>(missing_queue_wait).is_err());
+        let bypass = br#"{"maximum_open_connections":32,"maximum_open_connections_per_peer":8,"worker_threads":8,"maximum_queued_connections":16,"maximum_queue_wait_milliseconds":1000,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000,"unbounded":true}"#;
         assert!(decode_strict::<TransportLimitsWireConfig>(bypass).is_err());
 
         assert!(validate_transport_limits(&transport_limits(0, 0, 0)).is_err());
         assert!(validate_transport_limits(&transport_limits(129, 8, 8)).is_err());
         assert!(validate_transport_limits(&transport_limits(8, 9, 8)).is_err());
         assert!(validate_transport_limits(&transport_limits(8, 8, 9)).is_err());
+        let mut empty_queue = transport_limits(8, 4, 4);
+        empty_queue.maximum_queued_connections = 0;
+        assert!(validate_transport_limits(&empty_queue).is_err());
+        let mut oversized_queue = transport_limits(8, 4, 4);
+        oversized_queue.maximum_queued_connections = 9;
+        assert!(validate_transport_limits(&oversized_queue).is_err());
+        let mut short_queue_wait = transport_limits(8, 4, 4);
+        short_queue_wait.maximum_queue_wait_milliseconds = 99;
+        assert!(validate_transport_limits(&short_queue_wait).is_err());
+        let mut long_queue_wait = transport_limits(8, 4, 4);
+        long_queue_wait.maximum_queue_wait_milliseconds = 30_001;
+        assert!(validate_transport_limits(&long_queue_wait).is_err());
         let mut short_timeout = transport_limits(8, 4, 4);
         short_timeout.read_timeout_milliseconds = 99;
         assert!(validate_transport_limits(&short_timeout).is_err());
@@ -1166,6 +1251,66 @@ mod tests {
         assert!(events[0].request_id.is_none());
         assert!(events[0].target_digest.is_none());
         Ok(())
+    }
+
+    #[test]
+    fn queue_wait_deadline_rejects_before_request_parsing_and_emits_event()
+    -> Result<(), Box<dyn Error>> {
+        let sink = RecordingSecurityEventSink {
+            events: Mutex::new(Vec::new()),
+        };
+        let requester = AuthenticatedRequester {
+            user_id: "user-7".to_owned(),
+            agent_id: "agent-3".to_owned(),
+        };
+        let limit = Duration::from_secs(1);
+
+        assert!(!reject_expired_connection(
+            &sink,
+            &requester,
+            Duration::from_millis(999),
+            limit,
+        )?);
+        assert!(sink.events.lock().map_err(|_| "event lock")?.is_empty());
+
+        assert!(reject_expired_connection(
+            &sink,
+            &requester,
+            Duration::from_secs(1),
+            limit,
+        )?);
+        let events = sink.events.lock().map_err(|_| "event lock")?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, SecurityEventKind::ResourceAbusePattern);
+        assert_eq!(events[0].reason_code, "connection_queue_wait_expired");
+        assert!(events[0].request_id.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn queue_expiry_fails_closed_when_agent_green_event_fails() {
+        let requester = AuthenticatedRequester {
+            user_id: "user-7".to_owned(),
+            agent_id: "agent-3".to_owned(),
+        };
+        assert!(matches!(
+            reject_expired_connection(
+                &FailingSecurityEventSink,
+                &requester,
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            ),
+            Err(error) if error.code == ErrorCode::SecurityEventFailure
+        ));
+        assert!(matches!(
+            reject_expired_connection(
+                &FailingSecurityEventSink,
+                &requester,
+                Duration::from_millis(999),
+                Duration::from_secs(1),
+            ),
+            Ok(false)
+        ));
     }
 
     #[test]
