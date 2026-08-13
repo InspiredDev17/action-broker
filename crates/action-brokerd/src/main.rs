@@ -4,9 +4,8 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -30,7 +29,9 @@ use action_broker_core::network::{NetworkPolicyConfig, SecureHttpClient};
 use action_broker_core::policy::{DeterministicPolicy, PolicyConfig};
 use action_broker_core::privilege::{RuntimePrivilegeMonitor, RuntimePrivilegeProfileConfig};
 use action_broker_core::process::{ProcessInspectExecutor, ProcessInspectPolicyConfig};
-use action_broker_core::security_event::JsonlSecurityEventSink;
+use action_broker_core::security_event::{
+    JsonlSecurityEventSink, SecurityEvent, SecurityEventKind, SecurityEventSink,
+};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::VerifyingKey;
 use rustix::process::{self, Uid};
@@ -43,13 +44,170 @@ const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_KEY_BYTES: u64 = 4096;
 const SOCKET_MODE: u32 = 0o660;
-const MAX_OPEN_CONNECTIONS: usize = 128;
+const MAXIMUM_OPEN_CONNECTIONS: usize = 128;
+const MAXIMUM_CONNECTION_WORKERS: usize = 64;
+const MINIMUM_TRANSPORT_TIMEOUT_MILLISECONDS: u64 = 100;
+const MAXIMUM_TRANSPORT_TIMEOUT_MILLISECONDS: u64 = 30_000;
 
-struct ConnectionPermit(Arc<AtomicUsize>);
+#[derive(Debug, Default)]
+struct ConnectionAdmissionState {
+    open_connections: usize,
+    open_connections_by_peer: BTreeMap<u32, usize>,
+}
+
+#[derive(Debug, Clone)]
+struct ConnectionAdmission {
+    state: Arc<Mutex<ConnectionAdmissionState>>,
+    maximum_open_connections: usize,
+    maximum_open_connections_per_peer: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionAdmissionDenial {
+    GlobalLimit,
+    PeerLimit,
+}
+
+#[derive(Debug)]
+struct ConnectionPermit {
+    state: Arc<Mutex<ConnectionAdmissionState>>,
+    peer_uid: u32,
+}
 
 impl Drop for ConnectionPermit {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state.open_connections = state.open_connections.saturating_sub(1);
+        let should_remove = match state.open_connections_by_peer.get_mut(&self.peer_uid) {
+            Some(count) => {
+                *count = count.saturating_sub(1);
+                *count == 0
+            }
+            None => false,
+        };
+        if should_remove {
+            state.open_connections_by_peer.remove(&self.peer_uid);
+        }
+    }
+}
+
+impl ConnectionAdmission {
+    fn new(limits: &TransportLimitsWireConfig) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(ConnectionAdmissionState::default())),
+            maximum_open_connections: limits.maximum_open_connections,
+            maximum_open_connections_per_peer: limits.maximum_open_connections_per_peer,
+        }
+    }
+
+    fn try_acquire(
+        &self,
+        peer_uid: u32,
+    ) -> Result<Result<ConnectionPermit, ConnectionAdmissionDenial>, BrokerError> {
+        let mut state = self.state.lock().map_err(|_| {
+            BrokerError::new(
+                ErrorCode::Internal,
+                "connection admission state is unavailable",
+            )
+        })?;
+        if state.open_connections >= self.maximum_open_connections {
+            return Ok(Err(ConnectionAdmissionDenial::GlobalLimit));
+        }
+        let peer_count = state
+            .open_connections_by_peer
+            .get(&peer_uid)
+            .copied()
+            .unwrap_or(0);
+        if peer_count >= self.maximum_open_connections_per_peer {
+            return Ok(Err(ConnectionAdmissionDenial::PeerLimit));
+        }
+        state.open_connections += 1;
+        state
+            .open_connections_by_peer
+            .insert(peer_uid, peer_count + 1);
+        Ok(Ok(ConnectionPermit {
+            state: Arc::clone(&self.state),
+            peer_uid,
+        }))
+    }
+}
+
+struct ConnectionJob {
+    stream: UnixStream,
+    authenticated_requester: AuthenticatedRequester,
+    connection_permit: ConnectionPermit,
+}
+
+struct ConnectionWorkerPool {
+    sender: SyncSender<ConnectionJob>,
+    _workers: Vec<thread::JoinHandle<()>>,
+}
+
+impl ConnectionWorkerPool {
+    fn new(
+        broker: Arc<ActionBroker>,
+        limits: &TransportLimitsWireConfig,
+    ) -> Result<Self, BrokerError> {
+        let (sender, receiver) = mpsc::sync_channel(limits.maximum_open_connections);
+        let receiver = Arc::new(Mutex::new(receiver));
+        let read_timeout = Duration::from_millis(limits.read_timeout_milliseconds);
+        let write_timeout = Duration::from_millis(limits.write_timeout_milliseconds);
+        let mut workers = Vec::with_capacity(limits.worker_threads);
+        for worker_index in 0..limits.worker_threads {
+            let broker = Arc::clone(&broker);
+            let receiver = Arc::clone(&receiver);
+            let worker = thread::Builder::new()
+                .name(format!("action-broker-connection-{worker_index}"))
+                .spawn(move || {
+                    connection_worker(receiver, broker, read_timeout, write_timeout);
+                })
+                .map_err(|_| {
+                    BrokerError::new(ErrorCode::Internal, "connection worker could not start")
+                })?;
+            workers.push(worker);
+        }
+        Ok(Self {
+            sender,
+            _workers: workers,
+        })
+    }
+
+    fn try_submit(&self, job: ConnectionJob) -> Result<(), TrySendError<ConnectionJob>> {
+        self.sender.try_send(job)
+    }
+}
+
+fn connection_worker(
+    receiver: Arc<Mutex<Receiver<ConnectionJob>>>,
+    broker: Arc<ActionBroker>,
+    read_timeout: Duration,
+    write_timeout: Duration,
+) {
+    loop {
+        let job = {
+            let Ok(receiver) = receiver.lock() else {
+                return;
+            };
+            receiver.recv()
+        };
+        let Ok(job) = job else {
+            return;
+        };
+        let ConnectionJob {
+            stream,
+            authenticated_requester,
+            connection_permit,
+        } = job;
+        let _connection_permit = connection_permit;
+        let _ = handle_connection(
+            Arc::clone(&broker),
+            authenticated_requester,
+            stream,
+            read_timeout,
+            write_timeout,
+        );
     }
 }
 
@@ -106,6 +264,7 @@ struct DaemonConfig {
     network: NetworkPolicyConfig,
     #[serde(default)]
     process_inspection: ProcessInspectPolicyConfig,
+    transport_limits: TransportLimitsWireConfig,
     broker_limits: BrokerLimitsWireConfig,
 }
 
@@ -142,6 +301,16 @@ struct BrokerLimitsWireConfig {
     maximum_concurrent_actions_per_principal: usize,
     maximum_concurrent_actions_per_capability: usize,
     concurrency_wait_milliseconds: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TransportLimitsWireConfig {
+    maximum_open_connections: usize,
+    maximum_open_connections_per_peer: usize,
+    worker_threads: usize,
+    read_timeout_milliseconds: u64,
+    write_timeout_milliseconds: u64,
 }
 
 fn main() {
@@ -216,10 +385,21 @@ fn serve(config_path: &Path) -> Result<(), BrokerError> {
     let privilege_monitor = RuntimePrivilegeMonitor::from_config(config.privilege_profile.clone())?;
     privilege_monitor.verify()?;
     let peer_principals = validate_platform_peers(&config.platform_peers)?;
+    validate_transport_limits(&config.transport_limits)?;
     validate_state_paths(&config)?;
-    let broker = Arc::new(build_broker(&config, privilege_monitor)?);
+    let security_events: Arc<dyn SecurityEventSink> =
+        Arc::new(JsonlSecurityEventSink::open_with_maximum_bytes(
+            &config.agent_green_event_spool_path,
+            config.agent_green_event_spool_maximum_bytes,
+        )?);
+    let broker = Arc::new(build_broker(
+        &config,
+        privilege_monitor,
+        Arc::clone(&security_events),
+    )?);
+    let admission = ConnectionAdmission::new(&config.transport_limits);
+    let worker_pool = ConnectionWorkerPool::new(Arc::clone(&broker), &config.transport_limits)?;
     let listener = bind_socket(&config.socket_path, config.socket_group_id)?;
-    let open_connections = Arc::new(AtomicUsize::new(0));
     for incoming in listener.incoming() {
         let Ok(stream) = incoming else {
             continue;
@@ -230,16 +410,46 @@ fn serve(config_path: &Path) -> Result<(), BrokerError> {
         let Some(authenticated_requester) = peer_principals.get(&peer_uid).cloned() else {
             continue;
         };
-        if open_connections.load(Ordering::Acquire) >= MAX_OPEN_CONNECTIONS {
-            continue;
+        let connection_permit = match admission.try_acquire(peer_uid)? {
+            Ok(permit) => permit,
+            Err(ConnectionAdmissionDenial::GlobalLimit) => {
+                emit_connection_overload(
+                    security_events.as_ref(),
+                    &authenticated_requester,
+                    "connection_global_limit",
+                )?;
+                continue;
+            }
+            Err(ConnectionAdmissionDenial::PeerLimit) => {
+                emit_connection_overload(
+                    security_events.as_ref(),
+                    &authenticated_requester,
+                    "connection_peer_limit",
+                )?;
+                continue;
+            }
+        };
+        let job = ConnectionJob {
+            stream,
+            authenticated_requester,
+            connection_permit,
+        };
+        match worker_pool.try_submit(job) {
+            Ok(()) => {}
+            Err(TrySendError::Full(job)) => {
+                emit_connection_overload(
+                    security_events.as_ref(),
+                    &job.authenticated_requester,
+                    "connection_worker_queue_saturated",
+                )?;
+            }
+            Err(TrySendError::Disconnected(_job)) => {
+                return Err(BrokerError::new(
+                    ErrorCode::Internal,
+                    "connection worker pool stopped",
+                ));
+            }
         }
-        open_connections.fetch_add(1, Ordering::AcqRel);
-        let connection_permit = ConnectionPermit(Arc::clone(&open_connections));
-        let broker = Arc::clone(&broker);
-        thread::spawn(move || {
-            let _connection_permit = connection_permit;
-            let _ = handle_connection(broker, authenticated_requester, stream);
-        });
     }
     Err(BrokerError::new(
         ErrorCode::Internal,
@@ -250,6 +460,7 @@ fn serve(config_path: &Path) -> Result<(), BrokerError> {
 fn build_broker(
     config: &DaemonConfig,
     privilege_monitor: RuntimePrivilegeMonitor,
+    security_events: Arc<dyn SecurityEventSink>,
 ) -> Result<ActionBroker, BrokerError> {
     let mut trusted_keys = TrustedKeyRegistry::new();
     if config.approval_keys.is_empty() {
@@ -306,10 +517,6 @@ fn build_broker(
         }
         None => HashChainedJsonlAuditSink::open(&config.audit_log_path)?,
     });
-    let security_events = Arc::new(JsonlSecurityEventSink::open_with_maximum_bytes(
-        &config.agent_green_event_spool_path,
-        config.agent_green_event_spool_maximum_bytes,
-    )?);
     ActionBroker::new(
         policy,
         approvals,
@@ -337,12 +544,14 @@ fn handle_connection(
     broker: Arc<ActionBroker>,
     authenticated_requester: AuthenticatedRequester,
     mut stream: UnixStream,
+    read_timeout: Duration,
+    write_timeout: Duration,
 ) -> Result<(), BrokerError> {
     stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(read_timeout))
         .map_err(|_| transport_error("socket read timeout setup failed"))?;
     stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
+        .set_write_timeout(Some(write_timeout))
         .map_err(|_| transport_error("socket write timeout setup failed"))?;
     let frame = read_frame(&mut stream)?;
     let request: ActionRequest = decode_strict(&frame)?;
@@ -503,6 +712,37 @@ fn validate_platform_peers(
     Ok(principals)
 }
 
+fn validate_transport_limits(limits: &TransportLimitsWireConfig) -> Result<(), BrokerError> {
+    if limits.maximum_open_connections == 0
+        || limits.maximum_open_connections > MAXIMUM_OPEN_CONNECTIONS
+        || limits.maximum_open_connections_per_peer == 0
+        || limits.maximum_open_connections_per_peer > limits.maximum_open_connections
+        || limits.worker_threads == 0
+        || limits.worker_threads > MAXIMUM_CONNECTION_WORKERS
+        || limits.worker_threads > limits.maximum_open_connections
+        || !(MINIMUM_TRANSPORT_TIMEOUT_MILLISECONDS..=MAXIMUM_TRANSPORT_TIMEOUT_MILLISECONDS)
+            .contains(&limits.read_timeout_milliseconds)
+        || !(MINIMUM_TRANSPORT_TIMEOUT_MILLISECONDS..=MAXIMUM_TRANSPORT_TIMEOUT_MILLISECONDS)
+            .contains(&limits.write_timeout_milliseconds)
+    {
+        return Err(BrokerError::invalid(
+            "transport admission limits are outside the safe bound",
+        ));
+    }
+    Ok(())
+}
+
+fn emit_connection_overload(
+    security_events: &dyn SecurityEventSink,
+    authenticated_requester: &AuthenticatedRequester,
+    reason_code: &'static str,
+) -> Result<(), BrokerError> {
+    let mut event = SecurityEvent::new(SecurityEventKind::ResourceAbusePattern, reason_code);
+    event.user_id = Some(authenticated_requester.user_id.clone());
+    event.agent_id = Some(authenticated_requester.agent_id.clone());
+    security_events.emit(&event)
+}
+
 fn refuse_root() -> Result<(), BrokerError> {
     if process::geteuid() == Uid::ROOT {
         return Err(BrokerError::new(
@@ -654,8 +894,38 @@ fn transport_error(message: &'static str) -> BrokerError {
 #[cfg(test)]
 mod tests {
     use std::error::Error;
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    struct RecordingSecurityEventSink {
+        events: Mutex<Vec<SecurityEvent>>,
+    }
+
+    impl SecurityEventSink for RecordingSecurityEventSink {
+        fn emit(&self, event: &SecurityEvent) -> Result<(), BrokerError> {
+            self.events
+                .lock()
+                .map_err(|_| BrokerError::new(ErrorCode::Internal, "test event lock failed"))?
+                .push(event.clone());
+            Ok(())
+        }
+    }
+
+    fn transport_limits(
+        maximum_open_connections: usize,
+        maximum_open_connections_per_peer: usize,
+        worker_threads: usize,
+    ) -> TransportLimitsWireConfig {
+        TransportLimitsWireConfig {
+            maximum_open_connections,
+            maximum_open_connections_per_peer,
+            worker_threads,
+            read_timeout_milliseconds: 5_000,
+            write_timeout_milliseconds: 5_000,
+        }
+    }
 
     #[test]
     fn audit_verification_cli_binds_both_segment_heads() -> Result<(), Box<dyn Error>> {
@@ -770,6 +1040,131 @@ mod tests {
         assert!(decode_strict::<BrokerLimitsWireConfig>(missing_scope).is_err());
         let bypass = br#"{"maximum_concurrent_actions":8,"maximum_concurrent_actions_per_principal":4,"maximum_concurrent_actions_per_capability":4,"concurrency_wait_milliseconds":1000,"bypass":true}"#;
         assert!(decode_strict::<BrokerLimitsWireConfig>(bypass).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn transport_admission_limits_are_required_strict_and_bounded() -> Result<(), Box<dyn Error>> {
+        let valid = br#"{"maximum_open_connections":32,"maximum_open_connections_per_peer":8,"worker_threads":8,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000}"#;
+        let decoded = decode_strict::<TransportLimitsWireConfig>(valid)?;
+        validate_transport_limits(&decoded)?;
+
+        let missing_per_peer = br#"{"maximum_open_connections":32,"worker_threads":8,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000}"#;
+        assert!(decode_strict::<TransportLimitsWireConfig>(missing_per_peer).is_err());
+        let bypass = br#"{"maximum_open_connections":32,"maximum_open_connections_per_peer":8,"worker_threads":8,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000,"unbounded":true}"#;
+        assert!(decode_strict::<TransportLimitsWireConfig>(bypass).is_err());
+
+        assert!(validate_transport_limits(&transport_limits(0, 0, 0)).is_err());
+        assert!(validate_transport_limits(&transport_limits(129, 8, 8)).is_err());
+        assert!(validate_transport_limits(&transport_limits(8, 9, 8)).is_err());
+        assert!(validate_transport_limits(&transport_limits(8, 8, 9)).is_err());
+        let mut short_timeout = transport_limits(8, 4, 4);
+        short_timeout.read_timeout_milliseconds = 99;
+        assert!(validate_transport_limits(&short_timeout).is_err());
+        let mut long_timeout = transport_limits(8, 4, 4);
+        long_timeout.write_timeout_milliseconds = 30_001;
+        assert!(validate_transport_limits(&long_timeout).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn connection_admission_enforces_global_and_per_peer_limits() -> Result<(), Box<dyn Error>> {
+        let admission = ConnectionAdmission::new(&transport_limits(3, 2, 1));
+        let first = admission.try_acquire(1001)?.map_err(|_| "first denied")?;
+        let second = admission.try_acquire(1001)?.map_err(|_| "second denied")?;
+        assert!(matches!(
+            admission.try_acquire(1001)?,
+            Err(ConnectionAdmissionDenial::PeerLimit)
+        ));
+        let third = admission.try_acquire(1002)?.map_err(|_| "third denied")?;
+        assert!(matches!(
+            admission.try_acquire(1003)?,
+            Err(ConnectionAdmissionDenial::GlobalLimit)
+        ));
+
+        drop(first);
+        let replacement = admission
+            .try_acquire(1003)?
+            .map_err(|_| "released capacity was not restored")?;
+        drop((second, third, replacement));
+        assert_eq!(
+            admission
+                .state
+                .lock()
+                .map_err(|_| "state lock")?
+                .open_connections,
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_connection_admission_never_overshoots_peer_limit() -> Result<(), Box<dyn Error>> {
+        const CONTENDERS: usize = 32;
+        const LIMIT: usize = 8;
+        let admission = Arc::new(ConnectionAdmission::new(&transport_limits(16, LIMIT, 4)));
+        let admitted = Arc::new(AtomicUsize::new(0));
+        let ready = Arc::new(Barrier::new(CONTENDERS + 1));
+        let release = Arc::new(Barrier::new(CONTENDERS + 1));
+        let mut threads = Vec::new();
+        for _ in 0..CONTENDERS {
+            let admission = Arc::clone(&admission);
+            let admitted = Arc::clone(&admitted);
+            let ready = Arc::clone(&ready);
+            let release = Arc::clone(&release);
+            threads.push(thread::spawn(move || {
+                let permit = admission.try_acquire(1001).ok().and_then(Result::ok);
+                if permit.is_some() {
+                    admitted.fetch_add(1, Ordering::SeqCst);
+                }
+                ready.wait();
+                release.wait();
+                drop(permit);
+            }));
+        }
+        ready.wait();
+        assert_eq!(admitted.load(Ordering::SeqCst), LIMIT);
+        assert_eq!(
+            admission
+                .state
+                .lock()
+                .map_err(|_| "admission state")?
+                .open_connections,
+            LIMIT
+        );
+        release.wait();
+        for thread in threads {
+            assert!(thread.join().is_ok());
+        }
+        assert_eq!(
+            admission
+                .state
+                .lock()
+                .map_err(|_| "admission state")?
+                .open_connections,
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn connection_overload_emits_secret_free_agent_green_event() -> Result<(), Box<dyn Error>> {
+        let sink = RecordingSecurityEventSink {
+            events: Mutex::new(Vec::new()),
+        };
+        let requester = AuthenticatedRequester {
+            user_id: "user-7".to_owned(),
+            agent_id: "agent-3".to_owned(),
+        };
+        emit_connection_overload(&sink, &requester, "connection_peer_limit")?;
+        let events = sink.events.lock().map_err(|_| "event lock")?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, SecurityEventKind::ResourceAbusePattern);
+        assert_eq!(events[0].reason_code, "connection_peer_limit");
+        assert_eq!(events[0].user_id.as_deref(), Some("user-7"));
+        assert_eq!(events[0].agent_id.as_deref(), Some("agent-3"));
+        assert!(events[0].request_id.is_none());
+        assert!(events[0].target_digest.is_none());
         Ok(())
     }
 

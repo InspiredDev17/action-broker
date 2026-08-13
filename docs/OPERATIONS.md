@@ -22,7 +22,7 @@ regardless of representation, production configuration must provide:
 | --- | --- |
 | Identity | distinct unprivileged broker UID and Platform UID; exact Platform UID -> user/agent mapping |
 | Broker privilege | expected non-root UID/GID, exact supplementary GIDs, empty active capability sets, `NoNewPrivileges=true` |
-| Socket | absolute path, broker-owned setgid directory, Platform access group, `0660` socket, frame/request bounds |
+| Socket | absolute path, broker-owned setgid directory, Platform access group, `0660` socket, global/per-peer admission, fixed workers, frame and read/write bounds |
 | Approval trust | accepted token/schema versions, unique Ed25519 public-key IDs, required activation, optional retirement/revocation cutoffs, max lifetime and clock skew |
 | Replay | dedicated durable ledger path, permissions, full synchronization, maximum rows, post-expiration retention |
 | Permissions | user/agent permission source and fail-closed refresh behavior |
@@ -121,6 +121,13 @@ fields:
     "allowed_user_ids": [],
     "maximum_entries": 256
   },
+  "transport_limits": {
+    "maximum_open_connections": 32,
+    "maximum_open_connections_per_peer": 8,
+    "worker_threads": 8,
+    "read_timeout_milliseconds": 5000,
+    "write_timeout_milliseconds": 5000
+  },
   "broker_limits": {
     "maximum_concurrent_actions": 8,
     "maximum_concurrent_actions_per_principal": 4,
@@ -161,6 +168,16 @@ than 1,024 returned records. Both per-scope concurrency values are required,
 must be nonzero, and cannot exceed the global limit. Waiting requests observe
 cancellation and fail with a resource-limit outcome when the bounded wait
 expires; they do not consume a slot before admission.
+
+`transport_limits` is required. Open connections must be 1 through 128, the
+per-peer maximum must be nonzero and no greater than the global maximum, and
+the fixed worker count must be 1 through 64 and no greater than the global
+maximum. Read and write timeouts must each be 100 through 30,000 milliseconds.
+These are startup-validated administrative bounds, not caller-controlled hints.
+Connection admission increments global and per-peer counts in one critical
+section and releases both through an owned permit. Saturation closes the socket
+without parsing a request and emits an Agent Green resource-abuse event; if that
+mandatory event cannot be durably recorded, the accept loop fails closed.
 
 For the first audit segment, omit `audit_initial_previous_hash` to use the
 all-zero genesis. For every rotated segment, set it to the exact final

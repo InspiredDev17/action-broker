@@ -95,7 +95,7 @@ The broker emits structured Agent Green events for at least:
 | `secret_access_attempt` | Target matches protected credential or secret policy |
 | `forbidden_executable` | Program absent from registry or executable identity/arguments violate policy |
 | `forbidden_destination` | Scheme, host, IP, port, redirect, localhost/private/metadata target violates policy |
-| `resource_abuse_pattern` | Output, time, concurrency, process, CPU, memory, or file limit abuse |
+| `resource_abuse_pattern` | Connection, output, time, concurrency, process, CPU, memory, or file limit abuse |
 | `sandbox_failure` | Required isolation/control could not be established or failed during execution |
 | `unexpected_privilege_elevation` | Effective privilege exceeds the validated execution profile |
 
@@ -139,8 +139,13 @@ tests on the actual OS/filesystem/deployment profile.
 ## Denial-of-service posture
 
 Action Broker protects bounded availability, not unlimited service. It caps
-open connections at 128, bounds frames and socket reads, and limits active
-actions, DNS/redirect work, subprocess output, and audit/event record size.
+configured open connections at a hard ceiling of 128, applies a separate
+per-peer ceiling, services a bounded queue with at most 64 fixed connection
+workers, bounds frames and socket reads/writes, and limits active actions,
+DNS/redirect work, subprocess output, and audit/event record size. Admission is
+one atomic global/per-peer state transition, so concurrent accepts cannot
+overshoot either bound. Rejected authenticated peers produce mandatory
+secret-free Agent Green resource-abuse events before request parsing.
 The broker enforces bounded global, per-principal, and per-capability in-flight
 counts. Admission waits are bounded and cancellation-aware. It does not provide
 weighted fairness, persistent queues, or per-principal scheduling guarantees;
