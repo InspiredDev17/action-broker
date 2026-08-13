@@ -179,7 +179,7 @@ mandatory unauthorized-peer evidence, an interrupted partial-frame drain,
 socket cleanup, audit-chain verification, and a clean restart against the same
 durable state. It requires Linux, root for creating disposable identities, and
 the tools it checks at startup. Unsupported hosts exit with status 77 rather
-than manufacturing platform evidence. CI runs the same script on Ubuntu.
+than manufacturing platform evidence.
 
 Treat successful unit tests as source-level evidence, not proof that a
 particular deployed host provides every desired sandbox primitive. Before

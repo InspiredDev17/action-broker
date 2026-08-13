@@ -291,8 +291,8 @@ capabilities, and `NoNewPrivs`. It verifies a typed read allow path, an
 unconfigured same-IPC-group UID deny path and Agent Green event, an in-flight
 partial-frame first-signal drain, exact socket cleanup, the audit chain, and a
 restart using the same durable files. A pass qualifies this narrow lifecycle on
-the tested Linux host or CI runner only; it does not attest cgroups, seccomp,
-command execution, external effects, or the production service-manager profile.
+the tested Linux host only; it does not attest cgroups, seccomp, command
+execution, external effects, or the production service-manager profile.
 
 ### macOS
 
