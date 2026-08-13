@@ -34,10 +34,11 @@ const EXPIRED_APPROVAL_AGE_SECONDS: i64 = 120;
 const FUTURE_APPROVAL_OFFSET_SECONDS: i64 = 120;
 
 #[derive(Clone, Copy)]
-enum RequestTimeProfile {
-    Current,
-    Expired,
-    Future,
+enum RequestProfile {
+    CurrentElevated,
+    CurrentExplicit,
+    ExpiredElevated,
+    FutureElevated,
 }
 
 fn main() {
@@ -56,13 +57,16 @@ fn run() -> Result<(), Box<dyn Error>> {
             reject_extra(&mut arguments)?;
             println!("{}", hex::encode(signing_key().verifying_key().as_bytes()));
         }
-        "request" => issue_request(&mut arguments, RequestTimeProfile::Current)?,
-        "expired-request" => issue_request(&mut arguments, RequestTimeProfile::Expired)?,
-        "future-request" => issue_request(&mut arguments, RequestTimeProfile::Future)?,
+        "request" => issue_request(&mut arguments, RequestProfile::CurrentElevated)?,
+        "insufficient-approval-request" => {
+            issue_request(&mut arguments, RequestProfile::CurrentExplicit)?;
+        }
+        "expired-request" => issue_request(&mut arguments, RequestProfile::ExpiredElevated)?,
+        "future-request" => issue_request(&mut arguments, RequestProfile::FutureElevated)?,
         "verify" => verify_request_file(&mut arguments)?,
         _ => {
             return Err(invalid(
-                "mode must be public-key, request, expired-request, future-request, or verify",
+                "mode must be public-key, request, insufficient-approval-request, expired-request, future-request, or verify",
             )
             .into());
         }
@@ -80,7 +84,7 @@ fn verify_request_file(arguments: &mut impl Iterator<Item = String>) -> Result<(
 
 fn issue_request(
     arguments: &mut impl Iterator<Item = String>,
-    time_profile: RequestTimeProfile,
+    profile: RequestProfile,
 ) -> Result<(), Box<dyn Error>> {
     let request_id = Uuid::parse_str(&required(arguments, "request_id")?)?;
     let program_id = required(arguments, "program_id")?;
@@ -112,10 +116,16 @@ fn issue_request(
         approval_token: None,
     };
     let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())?;
-    let issued_at = match time_profile {
-        RequestTimeProfile::Current => now,
-        RequestTimeProfile::Expired => now.saturating_sub(EXPIRED_APPROVAL_AGE_SECONDS),
-        RequestTimeProfile::Future => now.saturating_add(FUTURE_APPROVAL_OFFSET_SECONDS),
+    let issued_at = match profile {
+        RequestProfile::CurrentElevated | RequestProfile::CurrentExplicit => now,
+        RequestProfile::ExpiredElevated => now.saturating_sub(EXPIRED_APPROVAL_AGE_SECONDS),
+        RequestProfile::FutureElevated => now.saturating_add(FUTURE_APPROVAL_OFFSET_SECONDS),
+    };
+    let approval_type = match profile {
+        RequestProfile::CurrentExplicit => ApprovalType::ExplicitUser,
+        RequestProfile::CurrentElevated
+        | RequestProfile::ExpiredElevated
+        | RequestProfile::FutureElevated => ApprovalType::ElevatedUser,
     };
     let claims = ApprovalClaimsV1 {
         version: APPROVAL_TOKEN_VERSION,
@@ -129,7 +139,7 @@ fn issue_request(
         target: request.target.clone(),
         issued_at_unix_seconds: issued_at,
         expires_at_unix_seconds: issued_at.saturating_add(APPROVAL_LIFETIME_SECONDS),
-        approval_type: ApprovalType::ElevatedUser,
+        approval_type,
         nonce,
     };
     let payload = serde_jcs::to_vec(&claims)?;
@@ -142,12 +152,15 @@ fn issue_request(
         }
         .to_compact()?,
     );
-    match time_profile {
-        RequestTimeProfile::Current => verify_fixture_request(&request)?,
-        RequestTimeProfile::Expired => {
+    match profile {
+        RequestProfile::CurrentElevated => verify_fixture_request(&request)?,
+        RequestProfile::CurrentExplicit => {
+            verify_invalid_fixture_request(&request, ApprovalError::ApprovalTypeMismatch)?;
+        }
+        RequestProfile::ExpiredElevated => {
             verify_time_invalid_fixture_request(&request, ApprovalError::Expired)?;
         }
-        RequestTimeProfile::Future => {
+        RequestProfile::FutureElevated => {
             verify_time_invalid_fixture_request(&request, ApprovalError::NotYetValid)?;
         }
     }
@@ -175,6 +188,24 @@ fn verify_time_invalid_fixture_request(
     );
     if !matches_expected {
         return Err(invalid("time-invalid fixture request had an unexpected result").into());
+    }
+    Ok(())
+}
+
+fn verify_invalid_fixture_request(
+    request: &ActionRequest,
+    expected: ApprovalError,
+) -> Result<(), Box<dyn Error>> {
+    let verifier = fixture_verifier()?;
+    let result = verifier.verify_embedded(request, &[ApprovalType::ElevatedUser]);
+    if !matches!(
+        (&result, expected),
+        (
+            Err(ApprovalError::ApprovalTypeMismatch),
+            ApprovalError::ApprovalTypeMismatch
+        )
+    ) {
+        return Err(invalid("invalid fixture request had an unexpected result").into());
     }
     Ok(())
 }

@@ -146,6 +146,13 @@ which means permission and deterministic policy are sufficient and no token is
 accepted as a substitute for missing permission. The policy maps each effective
 risk and target to an explicit set of accepted types.
 
+A correctly signed token with an approval type outside that exact accepted set
+is rejected before nonce consumption. The external response remains the generic
+`approval_invalid` classification so a caller cannot use the broker as an
+approval-policy discovery oracle. The mandatory local security event uses the
+same secret-free invalid-approval classification; it does not log the token or
+approver evidence.
+
 Approval ordering is explicit in configuration/code. String ordering or client
 claims never establish that one type is stronger than another. A standing grant
 must still be narrowly scoped and cannot authorize a capability, root,

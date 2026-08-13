@@ -294,11 +294,13 @@ restart using the same durable files. It also issues a short-lived, exact-scope
 test approval through the repository's Rust/JCS model. First it submits signed
 tokens from before and after the current validity window. Both require the
 external `approval_expired` classification and Agent Green evidence, with no
-audit start or process launch. It then issues a current token with the same
-request ID and nonce, changes the signed command argument without changing that
-token, and requires `approval_invalid` with the same no-effect guarantees. The
-original current token must still authorize the exact command, proving neither
-time-window failure nor failed binding consumed its nonce. The harness sends
+audit start or process launch. It then submits a current `ExplicitUser` token
+where the capability requires `ElevatedUser`, followed by a current elevated
+token whose signed command argument is changed without changing that token.
+Both require generic `approval_invalid` denials with the same no-effect
+guarantees. The exact current elevated token must still authorize the command,
+proving time-window, approval-strength, and binding failures did not consume its
+nonce. The harness sends
 `SIGTERM`, requires a broker-confirmed cancelled result, and proves no process
 under the broker test UID survives. After reopening the same SQLite ledger, it
 resubmits that exact token and requires a broker-confirmed `approval_replayed`

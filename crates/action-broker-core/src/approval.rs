@@ -1113,6 +1113,11 @@ mod tests {
             verifier.verify_at(&token, &request, &[ApprovalType::Administrator], NOW),
             Err(ApprovalError::ApprovalTypeMismatch)
         ));
+        assert!(
+            verifier
+                .verify_at(&token, &request, &[ApprovalType::ExplicitUser], NOW)
+                .is_ok()
+        );
         Ok(())
     }
 

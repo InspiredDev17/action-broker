@@ -61,12 +61,14 @@ normal daemon boundary. A test-only Rust issuer exercises real Ed25519/JCS
 approval verification for an approved `sleep`. The harness first submits a
 correctly signed not-yet-valid token and an expired token. Both produce the
 same external `approval_expired`/`expired_approval` classification without an
-audit start. A current token reuses the same nonce; its signed argument is then
-tampered, producing `approval_tampering` without an audit start. The exact
-current request remains usable, proving none of those failures consumed the
-nonce. The harness proves first-signal cancellation and descendant termination,
-then reopens the durable ledger and proves the consumed token is rejected before
-a second audit start or process launch, with mandatory `replayed_approval`
+audit start. A current token with insufficient approval strength reuses the same
+nonce and is rejected as `approval_invalid`; an elevated token then has its
+signed argument tampered and receives the same external denial. Both produce
+mandatory invalid-approval evidence without an audit start. The exact elevated
+request remains usable, proving none of those failures consumed the nonce. The
+harness proves first-signal cancellation and descendant termination, then
+reopens the durable ledger and proves the consumed token is rejected before a
+second audit start or process launch, with mandatory `replayed_approval`
 evidence. The embedded fixture key is not production authority. This still does
 not qualify general approved-command isolation, cgroup containment, production
 filesystem mounts, or external side-effect recovery.
