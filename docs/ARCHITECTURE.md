@@ -114,6 +114,17 @@ the health flag and exactly the configured worker count. Any mismatch emits a
 secret-free `sandbox_failure` with reason `connection_worker_lost` and shuts
 down; capacity is never silently degraded or replenished by an ad hoc thread.
 
+The first `SIGTERM` or `SIGINT` sets an atomic shutdown flag. The nonblocking
+listener observes it within its 10 millisecond poll, closes worker admission,
+and wakes the fixed worker set by dropping its queue sender. Queued sockets are
+discarded without parsing. A worker already waiting on broker execution
+propagates cancellation on its next bounded supervision poll. The listener
+waits only for the configured shutdown grace; exhaustion emits
+`sandbox_failure` with reason `shutdown_grace_exhausted` and returns a timeout
+failure. Authentication and protocol-abuse backoff sleeps also observe
+shutdown. A second termination signal is an explicit operator escalation and
+exits immediately.
+
 The bound socket records its device and inode immediately after creation and
 revalidates both after applying owner/group/mode policy. Its lifetime guard
 removes the pathname on ordinary return and Rust unwinding only when it still
@@ -121,7 +132,8 @@ names that exact socket inode. A replaced socket, regular file, or symlink is
 preserved. The socket directory is broker-owned and not writable by the Platform
 group, so the supported deployment has one writer for this pathname.
 
-Process abort, `SIGKILL`, power loss, and host crash do not run destructors. The
+Immediate second-signal exit, process abort, `SIGKILL`, power loss, and host
+crash do not run destructors. The
 daemon therefore still refuses every pre-existing pathname at startup rather
 than guessing that a socket is stale. Crash recovery remains an explicit
 operator action after confirming no broker process or listener is active.

@@ -38,6 +38,7 @@ use ed25519_dalek::VerifyingKey;
 use rustix::process::{self, Uid};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use signal_hook::consts::{SIGINT, SIGTERM};
 #[cfg(test)]
 use uuid::Uuid;
 
@@ -51,6 +52,7 @@ const MAXIMUM_FAILURES_PER_WINDOW: usize = 1_024;
 const MINIMUM_TRANSPORT_TIMEOUT_MILLISECONDS: u64 = 100;
 const MAXIMUM_TRANSPORT_TIMEOUT_MILLISECONDS: u64 = 30_000;
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Default)]
 struct ConnectionAdmissionState {
@@ -216,8 +218,9 @@ impl Drop for BoundSocket {
 }
 
 struct ConnectionWorkerPool {
-    sender: SyncSender<ConnectionJob>,
+    sender: Option<SyncSender<ConnectionJob>>,
     healthy: Arc<AtomicBool>,
+    shutdown_requested: Arc<AtomicBool>,
     active_workers: Arc<AtomicUsize>,
     expected_workers: usize,
     _workers: Vec<thread::JoinHandle<()>>,
@@ -241,6 +244,7 @@ struct ConnectionWorkerRuntime {
     security_events: Arc<dyn SecurityEventSink>,
     protocol_failure_gate: Arc<Mutex<FailureWindowGate>>,
     healthy: Arc<AtomicBool>,
+    shutdown_requested: Arc<AtomicBool>,
     maximum_queue_wait: Duration,
     read_timeout: Duration,
     write_timeout: Duration,
@@ -250,6 +254,7 @@ impl ConnectionWorkerPool {
     fn new(
         broker: Arc<ActionBroker>,
         security_events: Arc<dyn SecurityEventSink>,
+        shutdown_requested: Arc<AtomicBool>,
         limits: &TransportLimitsWireConfig,
     ) -> Result<Self, BrokerError> {
         let (sender, receiver) = mpsc::sync_channel(limits.maximum_queued_connections);
@@ -268,6 +273,7 @@ impl ConnectionWorkerPool {
             security_events,
             protocol_failure_gate,
             healthy: Arc::clone(&healthy),
+            shutdown_requested: Arc::clone(&shutdown_requested),
             maximum_queue_wait,
             read_timeout,
             write_timeout,
@@ -293,8 +299,9 @@ impl ConnectionWorkerPool {
             workers.push(worker);
         }
         Ok(Self {
-            sender,
+            sender: Some(sender),
             healthy,
+            shutdown_requested,
             active_workers,
             expected_workers: limits.worker_threads,
             _workers: workers,
@@ -302,7 +309,10 @@ impl ConnectionWorkerPool {
     }
 
     fn try_submit(&self, job: ConnectionJob) -> Result<(), TrySendError<ConnectionJob>> {
-        self.sender.try_send(job)
+        match &self.sender {
+            Some(sender) => sender.try_send(job),
+            None => Err(TrySendError::Disconnected(job)),
+        }
     }
 
     fn is_healthy(&self) -> bool {
@@ -311,6 +321,19 @@ impl ConnectionWorkerPool {
             self.active_workers.load(Ordering::Acquire),
             self.expected_workers,
         )
+    }
+
+    fn shutdown_and_wait(&mut self, maximum_wait: Duration) -> bool {
+        self.shutdown_requested.store(true, Ordering::Release);
+        self.sender.take();
+        let deadline = Instant::now() + maximum_wait;
+        while self.active_workers.load(Ordering::Acquire) != 0 {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(SHUTDOWN_POLL_INTERVAL);
+        }
+        true
     }
 }
 
@@ -323,7 +346,9 @@ fn connection_worker(
     runtime: ConnectionWorkerRuntime,
 ) {
     loop {
-        if !runtime.healthy.load(Ordering::Acquire) {
+        if !runtime.healthy.load(Ordering::Acquire)
+            || runtime.shutdown_requested.load(Ordering::Acquire)
+        {
             return;
         }
         let job = {
@@ -335,6 +360,9 @@ fn connection_worker(
         let Ok(job) = job else {
             return;
         };
+        if runtime.shutdown_requested.load(Ordering::Acquire) {
+            return;
+        }
         let ConnectionJob {
             stream,
             authenticated_requester,
@@ -359,12 +387,14 @@ fn connection_worker(
             Arc::clone(&runtime.broker),
             &authenticated_requester,
             stream,
+            &runtime.shutdown_requested,
             runtime.read_timeout,
             runtime.write_timeout,
         ) && report_authenticated_protocol_failure(
             runtime.security_events.as_ref(),
             &runtime.protocol_failure_gate,
             &authenticated_requester,
+            runtime.shutdown_requested.as_ref(),
             reason_code,
         )
         .is_err()
@@ -479,6 +509,7 @@ struct TransportLimitsWireConfig {
     authentication_failure_window_milliseconds: u64,
     maximum_protocol_failures_per_window: usize,
     protocol_failure_window_milliseconds: u64,
+    shutdown_grace_milliseconds: u64,
     read_timeout_milliseconds: u64,
     write_timeout_milliseconds: u64,
 }
@@ -549,6 +580,44 @@ fn print_capabilities() -> Result<(), BrokerError> {
     Ok(())
 }
 
+fn install_shutdown_signal_handlers() -> Result<Arc<AtomicBool>, BrokerError> {
+    let requested = Arc::new(AtomicBool::new(false));
+    for signal in [SIGTERM, SIGINT] {
+        signal_hook::flag::register_conditional_shutdown(signal, 1, Arc::clone(&requested))
+            .map_err(|_| {
+                BrokerError::new(
+                    ErrorCode::SandboxFailure,
+                    "termination signal escalation handler could not be installed",
+                )
+            })?;
+        signal_hook::flag::register(signal, Arc::clone(&requested)).map_err(|_| {
+            BrokerError::new(
+                ErrorCode::SandboxFailure,
+                "termination signal handler could not be installed",
+            )
+        })?;
+    }
+    Ok(requested)
+}
+
+fn finish_graceful_shutdown(
+    worker_pool: &mut ConnectionWorkerPool,
+    maximum_wait: Duration,
+    security_events: &dyn SecurityEventSink,
+) -> Result<(), BrokerError> {
+    if worker_pool.shutdown_and_wait(maximum_wait) {
+        return Ok(());
+    }
+    security_events.emit(&SecurityEvent::new(
+        SecurityEventKind::SandboxFailure,
+        "shutdown_grace_exhausted",
+    ))?;
+    Err(BrokerError::new(
+        ErrorCode::Timeout,
+        "connection workers did not stop within shutdown grace",
+    ))
+}
+
 fn serve(config_path: &Path) -> Result<(), BrokerError> {
     refuse_root()?;
     let config = read_secure_json::<DaemonConfig>(config_path, MAX_CONFIG_BYTES, "configuration")?;
@@ -562,6 +631,7 @@ fn serve(config_path: &Path) -> Result<(), BrokerError> {
             &config.agent_green_event_spool_path,
             config.agent_green_event_spool_maximum_bytes,
         )?);
+    let shutdown_requested = install_shutdown_signal_handlers()?;
     let broker = Arc::new(build_broker(
         &config,
         privilege_monitor,
@@ -578,9 +648,10 @@ fn serve(config_path: &Path) -> Result<(), BrokerError> {
                 .authentication_failure_window_milliseconds,
         ),
     );
-    let worker_pool = ConnectionWorkerPool::new(
+    let mut worker_pool = ConnectionWorkerPool::new(
         Arc::clone(&broker),
         Arc::clone(&security_events),
+        Arc::clone(&shutdown_requested),
         &config.transport_limits,
     )?;
     let listener = bind_socket(&config.socket_path, config.socket_group_id)?;
@@ -588,6 +659,13 @@ fn serve(config_path: &Path) -> Result<(), BrokerError> {
         .set_nonblocking(true)
         .map_err(|_| transport_error("Unix socket nonblocking setup failed"))?;
     loop {
+        if shutdown_requested.load(Ordering::Acquire) {
+            return finish_graceful_shutdown(
+                &mut worker_pool,
+                Duration::from_millis(config.transport_limits.shutdown_grace_milliseconds),
+                security_events.as_ref(),
+            );
+        }
         if !worker_pool.is_healthy() {
             emit_worker_pool_failure(security_events.as_ref())?;
             return Err(BrokerError::new(
@@ -614,6 +692,7 @@ fn serve(config_path: &Path) -> Result<(), BrokerError> {
             report_transport_authentication_failure(
                 security_events.as_ref(),
                 &mut authentication_failure_gate,
+                shutdown_requested.as_ref(),
                 "peer_credentials_unavailable",
             )?;
             continue;
@@ -622,6 +701,7 @@ fn serve(config_path: &Path) -> Result<(), BrokerError> {
             report_transport_authentication_failure(
                 security_events.as_ref(),
                 &mut authentication_failure_gate,
+                shutdown_requested.as_ref(),
                 "unauthorized_platform_peer",
             )?;
             continue;
@@ -757,6 +837,7 @@ fn handle_connection(
     broker: Arc<ActionBroker>,
     authenticated_requester: &AuthenticatedRequester,
     mut stream: UnixStream,
+    shutdown_requested: &AtomicBool,
     read_timeout: Duration,
     write_timeout: Duration,
 ) -> Result<Option<&'static str>, BrokerError> {
@@ -777,6 +858,9 @@ fn handle_connection(
         Ok(request) => request,
         Err(rejection) => return Ok(Some(rejection.reason_code)),
     };
+    if shutdown_requested.load(Ordering::Acquire) {
+        return Ok(None);
+    }
     let cancellation = CancellationToken::new();
     let worker_cancellation = cancellation.clone();
     let execution_requester = authenticated_requester.clone();
@@ -796,6 +880,9 @@ fn handle_connection(
                 return Err(transport_error("action worker stopped without a response"));
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                if shutdown_requested.load(Ordering::Acquire) {
+                    cancellation.cancel();
+                }
                 let mut probe = [0_u8; 1];
                 match stream.read(&mut probe) {
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -1004,6 +1091,8 @@ fn validate_transport_limits(limits: &TransportLimitsWireConfig) -> Result<(), B
         || !(MINIMUM_TRANSPORT_TIMEOUT_MILLISECONDS..=MAXIMUM_TRANSPORT_TIMEOUT_MILLISECONDS)
             .contains(&limits.protocol_failure_window_milliseconds)
         || !(MINIMUM_TRANSPORT_TIMEOUT_MILLISECONDS..=MAXIMUM_TRANSPORT_TIMEOUT_MILLISECONDS)
+            .contains(&limits.shutdown_grace_milliseconds)
+        || !(MINIMUM_TRANSPORT_TIMEOUT_MILLISECONDS..=MAXIMUM_TRANSPORT_TIMEOUT_MILLISECONDS)
             .contains(&limits.read_timeout_milliseconds)
         || !(MINIMUM_TRANSPORT_TIMEOUT_MILLISECONDS..=MAXIMUM_TRANSPORT_TIMEOUT_MILLISECONDS)
             .contains(&limits.write_timeout_milliseconds)
@@ -1064,6 +1153,7 @@ fn emit_worker_pool_failure(security_events: &dyn SecurityEventSink) -> Result<(
 fn report_transport_authentication_failure(
     security_events: &dyn SecurityEventSink,
     failure_gate: &mut FailureWindowGate,
+    shutdown_requested: &AtomicBool,
     reason_code: &'static str,
 ) -> Result<(), BrokerError> {
     security_events.emit(&SecurityEvent::new(
@@ -1071,7 +1161,7 @@ fn report_transport_authentication_failure(
         reason_code,
     ))?;
     if let Some(backoff) = failure_gate.record_failure_at(Instant::now()) {
-        thread::sleep(backoff);
+        sleep_until_or_shutdown(backoff, shutdown_requested);
     }
     Ok(())
 }
@@ -1080,6 +1170,7 @@ fn report_authenticated_protocol_failure(
     security_events: &dyn SecurityEventSink,
     failure_gate: &Mutex<FailureWindowGate>,
     authenticated_requester: &AuthenticatedRequester,
+    shutdown_requested: &AtomicBool,
     reason_code: &'static str,
 ) -> Result<(), BrokerError> {
     emit_connection_overload(security_events, authenticated_requester, reason_code)?;
@@ -1088,9 +1179,20 @@ fn report_authenticated_protocol_failure(
         .map_err(|_| BrokerError::new(ErrorCode::Internal, "protocol failure gate is unavailable"))?
         .record_failure_at(Instant::now());
     if let Some(backoff) = backoff {
-        thread::sleep(backoff);
+        sleep_until_or_shutdown(backoff, shutdown_requested);
     }
     Ok(())
+}
+
+fn sleep_until_or_shutdown(duration: Duration, shutdown_requested: &AtomicBool) {
+    let deadline = Instant::now() + duration;
+    while !shutdown_requested.load(Ordering::Acquire) {
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
+        thread::sleep(SHUTDOWN_POLL_INTERVAL.min(deadline.saturating_duration_since(now)));
+    }
 }
 
 fn refuse_root() -> Result<(), BrokerError> {
@@ -1293,6 +1395,7 @@ mod tests {
             authentication_failure_window_milliseconds: 1_000,
             maximum_protocol_failures_per_window: 16,
             protocol_failure_window_milliseconds: 1_000,
+            shutdown_grace_milliseconds: 5_000,
             read_timeout_milliseconds: 5_000,
             write_timeout_milliseconds: 5_000,
         }
@@ -1445,19 +1548,21 @@ mod tests {
 
     #[test]
     fn transport_admission_limits_are_required_strict_and_bounded() -> Result<(), Box<dyn Error>> {
-        let valid = br#"{"maximum_open_connections":32,"maximum_open_connections_per_peer":8,"worker_threads":8,"maximum_queued_connections":16,"maximum_queue_wait_milliseconds":1000,"maximum_authentication_failures_per_window":16,"authentication_failure_window_milliseconds":1000,"maximum_protocol_failures_per_window":16,"protocol_failure_window_milliseconds":1000,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000}"#;
+        let valid = br#"{"maximum_open_connections":32,"maximum_open_connections_per_peer":8,"worker_threads":8,"maximum_queued_connections":16,"maximum_queue_wait_milliseconds":1000,"maximum_authentication_failures_per_window":16,"authentication_failure_window_milliseconds":1000,"maximum_protocol_failures_per_window":16,"protocol_failure_window_milliseconds":1000,"shutdown_grace_milliseconds":5000,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000}"#;
         let decoded = decode_strict::<TransportLimitsWireConfig>(valid)?;
         validate_transport_limits(&decoded)?;
 
-        let missing_per_peer = br#"{"maximum_open_connections":32,"worker_threads":8,"maximum_queued_connections":16,"maximum_queue_wait_milliseconds":1000,"maximum_authentication_failures_per_window":16,"authentication_failure_window_milliseconds":1000,"maximum_protocol_failures_per_window":16,"protocol_failure_window_milliseconds":1000,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000}"#;
+        let missing_per_peer = br#"{"maximum_open_connections":32,"worker_threads":8,"maximum_queued_connections":16,"maximum_queue_wait_milliseconds":1000,"maximum_authentication_failures_per_window":16,"authentication_failure_window_milliseconds":1000,"maximum_protocol_failures_per_window":16,"protocol_failure_window_milliseconds":1000,"shutdown_grace_milliseconds":5000,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000}"#;
         assert!(decode_strict::<TransportLimitsWireConfig>(missing_per_peer).is_err());
-        let missing_queue_wait = br#"{"maximum_open_connections":32,"maximum_open_connections_per_peer":8,"worker_threads":8,"maximum_queued_connections":16,"maximum_authentication_failures_per_window":16,"authentication_failure_window_milliseconds":1000,"maximum_protocol_failures_per_window":16,"protocol_failure_window_milliseconds":1000,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000}"#;
+        let missing_queue_wait = br#"{"maximum_open_connections":32,"maximum_open_connections_per_peer":8,"worker_threads":8,"maximum_queued_connections":16,"maximum_authentication_failures_per_window":16,"authentication_failure_window_milliseconds":1000,"maximum_protocol_failures_per_window":16,"protocol_failure_window_milliseconds":1000,"shutdown_grace_milliseconds":5000,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000}"#;
         assert!(decode_strict::<TransportLimitsWireConfig>(missing_queue_wait).is_err());
-        let missing_authentication_window = br#"{"maximum_open_connections":32,"maximum_open_connections_per_peer":8,"worker_threads":8,"maximum_queued_connections":16,"maximum_queue_wait_milliseconds":1000,"maximum_authentication_failures_per_window":16,"maximum_protocol_failures_per_window":16,"protocol_failure_window_milliseconds":1000,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000}"#;
+        let missing_authentication_window = br#"{"maximum_open_connections":32,"maximum_open_connections_per_peer":8,"worker_threads":8,"maximum_queued_connections":16,"maximum_queue_wait_milliseconds":1000,"maximum_authentication_failures_per_window":16,"maximum_protocol_failures_per_window":16,"protocol_failure_window_milliseconds":1000,"shutdown_grace_milliseconds":5000,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000}"#;
         assert!(decode_strict::<TransportLimitsWireConfig>(missing_authentication_window).is_err());
-        let missing_protocol_window = br#"{"maximum_open_connections":32,"maximum_open_connections_per_peer":8,"worker_threads":8,"maximum_queued_connections":16,"maximum_queue_wait_milliseconds":1000,"maximum_authentication_failures_per_window":16,"authentication_failure_window_milliseconds":1000,"maximum_protocol_failures_per_window":16,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000}"#;
+        let missing_protocol_window = br#"{"maximum_open_connections":32,"maximum_open_connections_per_peer":8,"worker_threads":8,"maximum_queued_connections":16,"maximum_queue_wait_milliseconds":1000,"maximum_authentication_failures_per_window":16,"authentication_failure_window_milliseconds":1000,"maximum_protocol_failures_per_window":16,"shutdown_grace_milliseconds":5000,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000}"#;
         assert!(decode_strict::<TransportLimitsWireConfig>(missing_protocol_window).is_err());
-        let bypass = br#"{"maximum_open_connections":32,"maximum_open_connections_per_peer":8,"worker_threads":8,"maximum_queued_connections":16,"maximum_queue_wait_milliseconds":1000,"maximum_authentication_failures_per_window":16,"authentication_failure_window_milliseconds":1000,"maximum_protocol_failures_per_window":16,"protocol_failure_window_milliseconds":1000,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000,"unbounded":true}"#;
+        let missing_shutdown_grace = br#"{"maximum_open_connections":32,"maximum_open_connections_per_peer":8,"worker_threads":8,"maximum_queued_connections":16,"maximum_queue_wait_milliseconds":1000,"maximum_authentication_failures_per_window":16,"authentication_failure_window_milliseconds":1000,"maximum_protocol_failures_per_window":16,"protocol_failure_window_milliseconds":1000,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000}"#;
+        assert!(decode_strict::<TransportLimitsWireConfig>(missing_shutdown_grace).is_err());
+        let bypass = br#"{"maximum_open_connections":32,"maximum_open_connections_per_peer":8,"worker_threads":8,"maximum_queued_connections":16,"maximum_queue_wait_milliseconds":1000,"maximum_authentication_failures_per_window":16,"authentication_failure_window_milliseconds":1000,"maximum_protocol_failures_per_window":16,"protocol_failure_window_milliseconds":1000,"shutdown_grace_milliseconds":5000,"read_timeout_milliseconds":5000,"write_timeout_milliseconds":5000,"unbounded":true}"#;
         assert!(decode_strict::<TransportLimitsWireConfig>(bypass).is_err());
 
         assert!(validate_transport_limits(&transport_limits(0, 0, 0)).is_err());
@@ -1500,6 +1605,12 @@ mod tests {
         let mut long_protocol_window = transport_limits(8, 4, 4);
         long_protocol_window.protocol_failure_window_milliseconds = 30_001;
         assert!(validate_transport_limits(&long_protocol_window).is_err());
+        let mut short_shutdown_grace = transport_limits(8, 4, 4);
+        short_shutdown_grace.shutdown_grace_milliseconds = 99;
+        assert!(validate_transport_limits(&short_shutdown_grace).is_err());
+        let mut long_shutdown_grace = transport_limits(8, 4, 4);
+        long_shutdown_grace.shutdown_grace_milliseconds = 30_001;
+        assert!(validate_transport_limits(&long_shutdown_grace).is_err());
         let mut short_timeout = transport_limits(8, 4, 4);
         short_timeout.read_timeout_milliseconds = 99;
         assert!(validate_transport_limits(&short_timeout).is_err());
@@ -1697,7 +1808,13 @@ mod tests {
             events: Mutex::new(Vec::new()),
         };
         let mut gate = FailureWindowGate::new(16, Duration::from_secs(1));
-        report_transport_authentication_failure(&sink, &mut gate, "unauthorized_platform_peer")?;
+        let shutdown_requested = AtomicBool::new(false);
+        report_transport_authentication_failure(
+            &sink,
+            &mut gate,
+            &shutdown_requested,
+            "unauthorized_platform_peer",
+        )?;
 
         let events = sink.events.lock().map_err(|_| "event lock")?;
         assert_eq!(events.len(), 1);
@@ -1713,10 +1830,12 @@ mod tests {
     #[test]
     fn transport_authentication_failure_stops_when_event_fails() {
         let mut gate = FailureWindowGate::new(16, Duration::from_secs(1));
+        let shutdown_requested = AtomicBool::new(false);
         assert!(matches!(
             report_transport_authentication_failure(
                 &FailingSecurityEventSink,
                 &mut gate,
+                &shutdown_requested,
                 "peer_credentials_unavailable",
             ),
             Err(error) if error.code == ErrorCode::SecurityEventFailure
@@ -1735,8 +1854,15 @@ mod tests {
             user_id: "user-7".to_owned(),
             agent_id: "agent-3".to_owned(),
         };
+        let shutdown_requested = AtomicBool::new(false);
 
-        report_authenticated_protocol_failure(&sink, &gate, &requester, "request_schema_invalid")?;
+        report_authenticated_protocol_failure(
+            &sink,
+            &gate,
+            &requester,
+            &shutdown_requested,
+            "request_schema_invalid",
+        )?;
         let events = sink.events.lock().map_err(|_| "event lock")?;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, SecurityEventKind::ResourceAbusePattern);
@@ -1756,11 +1882,13 @@ mod tests {
             user_id: "user-7".to_owned(),
             agent_id: "agent-3".to_owned(),
         };
+        let shutdown_requested = AtomicBool::new(false);
         assert!(matches!(
             report_authenticated_protocol_failure(
                 &FailingSecurityEventSink,
                 &gate,
                 &requester,
+                &shutdown_requested,
                 "request_frame_size_invalid",
             ),
             Err(error) if error.code == ErrorCode::SecurityEventFailure
@@ -1822,6 +1950,63 @@ mod tests {
         assert!(!worker_pool_is_healthy(true, 3, 4));
         assert!(!worker_pool_is_healthy(true, 5, 4));
         assert!(!worker_pool_is_healthy(false, 4, 4));
+    }
+
+    #[test]
+    fn worker_pool_shutdown_stops_admission_and_waits_for_workers() {
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let active_workers = Arc::new(AtomicUsize::new(1));
+        let worker_shutdown = Arc::clone(&shutdown_requested);
+        let worker_active = Arc::clone(&active_workers);
+        let worker = thread::spawn(move || {
+            while !worker_shutdown.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            worker_active.fetch_sub(1, Ordering::AcqRel);
+        });
+        let mut pool = ConnectionWorkerPool {
+            sender: Some(sender),
+            healthy: Arc::new(AtomicBool::new(true)),
+            shutdown_requested: Arc::clone(&shutdown_requested),
+            active_workers: Arc::clone(&active_workers),
+            expected_workers: 1,
+            _workers: vec![worker],
+        };
+
+        assert!(pool.shutdown_and_wait(Duration::from_secs(1)));
+        assert!(shutdown_requested.load(Ordering::Acquire));
+        assert_eq!(active_workers.load(Ordering::Acquire), 0);
+        assert!(pool.sender.is_none());
+    }
+
+    #[test]
+    fn shutdown_grace_exhaustion_is_fail_closed_and_auditable() -> Result<(), Box<dyn Error>> {
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        let mut pool = ConnectionWorkerPool {
+            sender: Some(sender),
+            healthy: Arc::new(AtomicBool::new(true)),
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
+            active_workers: Arc::new(AtomicUsize::new(1)),
+            expected_workers: 1,
+            _workers: Vec::new(),
+        };
+        let sink = RecordingSecurityEventSink {
+            events: Mutex::new(Vec::new()),
+        };
+
+        let error = match finish_graceful_shutdown(&mut pool, Duration::ZERO, &sink) {
+            Ok(()) => return Err("an active worker must exhaust a zero-length grace".into()),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, ErrorCode::Timeout);
+        assert!(pool.shutdown_requested.load(Ordering::Acquire));
+        assert!(pool.sender.is_none());
+        let events = sink.events.lock().map_err(|_| "event lock")?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, SecurityEventKind::SandboxFailure);
+        assert_eq!(events[0].reason_code, "shutdown_grace_exhausted");
+        Ok(())
     }
 
     #[test]

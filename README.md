@@ -100,6 +100,9 @@ Action Broker is designed to fail closed:
   bounded protocol-abuse events before broker authorization or execution;
 - exact worker-liveness accounting terminates the daemon if any configured
   connection worker returns or unwinds unexpectedly;
+- the first `SIGTERM` or `SIGINT` stops admission, cancels active broker waits,
+  drains workers within an explicit grace, and reports grace exhaustion before
+  exiting nonzero; a second termination signal forces immediate exit;
 - normal and fail-closed daemon exits remove only the exact device/inode socket
   created by that process and preserve any replacement object;
 - daemon readiness and every action verify exact real/effective/saved/fs IDs,

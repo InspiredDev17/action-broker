@@ -166,9 +166,17 @@ requires the exact configured live count; return, panic, receiver failure, or
 poisoned synchronization cannot silently reduce capacity. Lost-worker shutdown
 is reported as `connection_worker_lost` when the mandatory event sink remains
 available.
+The first `SIGTERM` or `SIGINT` stops admission, closes the bounded work queue,
+requests cancellation of active broker waits, and drains the fixed workers only
+through a startup-validated grace. Grace exhaustion is a fail-closed timeout and
+emits `shutdown_grace_exhausted`; it is never reported as a clean drain. A
+second termination signal forces immediate exit. Cancellation remains
+side-effect-ambiguous, and an uncooperative kernel or external backend can
+outlive the grace even though the broker stops waiting.
 Socket cleanup is device/inode-bound and refuses to delete a replacement object.
-It is destructor-based and therefore not a crash-consistency guarantee: abort,
-`SIGKILL`, power loss, or host crash can leave a stale socket. Startup refuses
+It is destructor-based and therefore not a crash-consistency guarantee: forced
+second-signal exit, abort, `SIGKILL`, power loss, or host crash can leave a stale
+socket. Startup refuses
 that pathname until an operator verifies and quarantines it; availability is
 preferred over unsafe automatic unlinking. The supported deployment assumes a
 single broker process under its dedicated UID and a broker-owned socket parent.

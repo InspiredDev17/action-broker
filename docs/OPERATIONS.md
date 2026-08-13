@@ -131,6 +131,7 @@ fields:
     "authentication_failure_window_milliseconds": 1000,
     "maximum_protocol_failures_per_window": 16,
     "protocol_failure_window_milliseconds": 1000,
+    "shutdown_grace_milliseconds": 5000,
     "read_timeout_milliseconds": 5000,
     "write_timeout_milliseconds": 5000
   },
@@ -179,8 +180,8 @@ expires; they do not consume a slot before admission.
 per-peer maximum must be nonzero and no greater than the global maximum, and
 the fixed worker count must be 1 through 64 and no greater than the global
 maximum. The queue capacity must be 1 through the configured global connection
-maximum. Queue residence, read, and write timeouts must each be 100 through
-30,000 milliseconds. The authentication-failure threshold must be 1 through
+maximum. Queue residence, shutdown grace, read, and write timeouts must each be
+100 through 30,000 milliseconds. The authentication-failure threshold must be 1 through
 1,024 and its window must be 100 through 30,000 milliseconds. The authenticated
 protocol-failure threshold and window have the same bounds. These are
 startup-validated administrative limits, not caller-controlled hints.
@@ -225,13 +226,30 @@ mask repeated exits by dynamically adding unreviewed worker threads.
 
 ## Socket shutdown and crash recovery
 
-On normal return or fail-closed Rust unwinding, the daemon closes and removes
+On the first `SIGTERM` or `SIGINT`, the daemon stops accepting sockets, closes
+the bounded worker queue, requests cancellation of active broker waits, and
+waits no longer than `shutdown_grace_milliseconds` for every fixed worker to
+exit. Queued sockets are closed without parsing. Authentication and
+protocol-failure backoffs are interruptible. A completed drain returns normally;
+grace exhaustion emits the secret-free Agent Green event
+`shutdown_grace_exhausted` and returns a timeout so the service exits nonzero.
+Do not treat cancellation as rollback or assume an external effect was retracted.
+
+A second `SIGTERM` or `SIGINT` forces immediate process exit. Use it only as an
+operator escalation after preserving diagnostics; it bypasses the bounded drain
+and may bypass socket cleanup. Service managers should send one termination
+signal, allow the configured grace plus a small supervision margin, and use
+`SIGKILL` only after that deadline.
+
+On normal return, completed first-signal drain, or fail-closed Rust unwinding,
+the daemon closes and removes
 only the socket pathname whose device and inode match the socket it created.
 If another object replaced that pathname, cleanup leaves it untouched. This
 prevents shutdown code from deleting an attacker- or operator-created file based
 only on a familiar name.
 
-`SIGKILL`, process abort, power loss, and host crash bypass this cleanup. Startup
+Forced second-signal exit, `SIGKILL`, process abort, power loss, and host crash
+bypass this cleanup. Startup
 intentionally refuses any existing socket pathname. Before recovering, stop the
 service, confirm no process has the socket open or is listening, inspect that
 the parent is the configured broker-owned non-group-writable directory, and
