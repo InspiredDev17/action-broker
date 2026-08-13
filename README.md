@@ -100,6 +100,8 @@ Action Broker is designed to fail closed:
   bounded protocol-abuse events before broker authorization or execution;
 - exact worker-liveness accounting terminates the daemon if any configured
   connection worker returns or unwinds unexpectedly;
+- normal and fail-closed daemon exits remove only the exact device/inode socket
+  created by that process and preserve any replacement object;
 - daemon readiness and every action verify exact real/effective/saved/fs IDs,
   supplementary groups, empty active Linux capability sets, and inherited
   `NoNewPrivs`; and

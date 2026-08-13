@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -190,6 +190,29 @@ struct ConnectionJob {
     authenticated_requester: AuthenticatedRequester,
     connection_permit: ConnectionPermit,
     accepted_at: Instant,
+}
+
+struct BoundSocket {
+    listener: UnixListener,
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+impl BoundSocket {
+    fn set_nonblocking(&self, nonblocking: bool) -> std::io::Result<()> {
+        self.listener.set_nonblocking(nonblocking)
+    }
+
+    fn accept(&self) -> std::io::Result<(UnixStream, std::os::unix::net::SocketAddr)> {
+        self.listener.accept()
+    }
+}
+
+impl Drop for BoundSocket {
+    fn drop(&mut self) {
+        let _ = remove_socket_if_owned(&self.path, self.device, self.inode);
+    }
 }
 
 struct ConnectionWorkerPool {
@@ -840,7 +863,7 @@ fn decode_strict<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, Broker
     Ok(value)
 }
 
-fn bind_socket(path: &Path, socket_group_id: u32) -> Result<UnixListener, BrokerError> {
+fn bind_socket(path: &Path, socket_group_id: u32) -> Result<BoundSocket, BrokerError> {
     if !path.is_absolute() {
         return Err(BrokerError::invalid("socket path must be absolute"));
     }
@@ -864,20 +887,59 @@ fn bind_socket(path: &Path, socket_group_id: u32) -> Result<UnixListener, Broker
     }
     let listener =
         UnixListener::bind(path).map_err(|_| transport_error("Unix socket cannot be bound"))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(SOCKET_MODE))
-        .map_err(|_| transport_error("Unix socket permissions cannot be restricted"))?;
-    let socket_metadata = fs::symlink_metadata(path)
-        .map_err(|_| transport_error("Unix socket cannot be inspected after binding"))?;
-    if socket_metadata.uid() != process::geteuid().as_raw()
+    let created_metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_socket() => metadata,
+        _ => {
+            return Err(transport_error(
+                "Unix socket cannot be inspected after binding",
+            ));
+        }
+    };
+    let device = created_metadata.dev();
+    let inode = created_metadata.ino();
+    if fs::set_permissions(path, fs::Permissions::from_mode(SOCKET_MODE)).is_err() {
+        let _ = remove_socket_if_owned(path, device, inode);
+        return Err(transport_error(
+            "Unix socket permissions cannot be restricted",
+        ));
+    }
+    let Ok(socket_metadata) = fs::symlink_metadata(path) else {
+        let _ = remove_socket_if_owned(path, device, inode);
+        return Err(transport_error(
+            "Unix socket cannot be inspected after binding",
+        ));
+    };
+    if !socket_metadata.file_type().is_socket()
+        || socket_metadata.dev() != device
+        || socket_metadata.ino() != inode
+        || socket_metadata.uid() != process::geteuid().as_raw()
         || socket_metadata.gid() != socket_group_id
         || socket_metadata.mode() & 0o777 != SOCKET_MODE
     {
-        let _ = fs::remove_file(path);
+        let _ = remove_socket_if_owned(path, device, inode);
         return Err(transport_error(
-            "Unix socket owner, group, or permissions are not the configured values",
+            "Unix socket identity, owner, group, or permissions are not configured values",
         ));
     }
-    Ok(listener)
+    Ok(BoundSocket {
+        listener,
+        path: path.to_path_buf(),
+        device,
+        inode,
+    })
+}
+
+fn remove_socket_if_owned(path: &Path, device: u64, inode: u64) -> Result<bool, BrokerError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(transport_error("Unix socket cleanup inspection failed")),
+    };
+    if !metadata.file_type().is_socket() || metadata.dev() != device || metadata.ino() != inode {
+        return Ok(false);
+    }
+    fs::remove_file(path).map_err(|_| transport_error("Unix socket cleanup failed"))?;
+    Ok(true)
 }
 
 fn peer_uid(stream: &UnixStream) -> Option<u32> {
@@ -1189,6 +1251,7 @@ mod tests {
     use std::sync::Barrier;
 
     use super::*;
+    use tempfile::tempdir;
 
     struct RecordingSecurityEventSink {
         events: Mutex<Vec<SecurityEvent>>,
@@ -1774,6 +1837,66 @@ mod tests {
         assert!(events[0].request_id.is_none());
         assert!(events[0].user_id.is_none());
         assert!(events[0].target_digest.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn bound_socket_drop_removes_only_its_own_inode() -> Result<(), Box<dyn Error>> {
+        let directory = tempdir()?;
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o750))?;
+        let socket_path = directory.path().join("broker.sock");
+        let bound = bind_socket(&socket_path, process::getegid().as_raw())?;
+        let metadata = fs::symlink_metadata(&socket_path)?;
+        assert_eq!(metadata.dev(), bound.device);
+        assert_eq!(metadata.ino(), bound.inode);
+
+        drop(bound);
+        assert!(matches!(
+            fs::symlink_metadata(&socket_path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn bound_socket_drop_preserves_replacement_socket() -> Result<(), Box<dyn Error>> {
+        let directory = tempdir()?;
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o750))?;
+        let socket_path = directory.path().join("broker.sock");
+        let bound = bind_socket(&socket_path, process::getegid().as_raw())?;
+        fs::remove_file(&socket_path)?;
+        let replacement = UnixListener::bind(&socket_path)?;
+        let replacement_metadata = fs::symlink_metadata(&socket_path)?;
+        assert_ne!(replacement_metadata.ino(), bound.inode);
+
+        drop(bound);
+        let after_drop = fs::symlink_metadata(&socket_path)?;
+        assert!(after_drop.file_type().is_socket());
+        assert_eq!(after_drop.ino(), replacement_metadata.ino());
+        drop(replacement);
+        fs::remove_file(&socket_path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn socket_cleanup_preserves_non_socket_replacement() -> Result<(), Box<dyn Error>> {
+        let directory = tempdir()?;
+        let socket_path = directory.path().join("broker.sock");
+        let original = UnixListener::bind(&socket_path)?;
+        let original_metadata = fs::symlink_metadata(&socket_path)?;
+        fs::remove_file(&socket_path)?;
+        File::options()
+            .write(true)
+            .create_new(true)
+            .open(&socket_path)?;
+
+        assert!(!remove_socket_if_owned(
+            &socket_path,
+            original_metadata.dev(),
+            original_metadata.ino(),
+        )?);
+        assert!(fs::symlink_metadata(&socket_path)?.is_file());
+        drop(original);
         Ok(())
     }
 

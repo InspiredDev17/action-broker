@@ -223,6 +223,26 @@ within its 10 millisecond health interval. Configure the service manager to
 restart only after retaining the Agent Green spool and crash diagnostics; do not
 mask repeated exits by dynamically adding unreviewed worker threads.
 
+## Socket shutdown and crash recovery
+
+On normal return or fail-closed Rust unwinding, the daemon closes and removes
+only the socket pathname whose device and inode match the socket it created.
+If another object replaced that pathname, cleanup leaves it untouched. This
+prevents shutdown code from deleting an attacker- or operator-created file based
+only on a familiar name.
+
+`SIGKILL`, process abort, power loss, and host crash bypass this cleanup. Startup
+intentionally refuses any existing socket pathname. Before recovering, stop the
+service, confirm no process has the socket open or is listening, inspect that
+the parent is the configured broker-owned non-group-writable directory, and
+verify the object is a socket with the configured broker UID, IPC GID, and mode.
+Move the stale socket to a broker-only quarantine name in the same directory,
+restart, verify the new socket identity and readiness, then remove the quarantined
+object through the host's reviewed administrative workflow. Never add automatic
+"unlink whatever exists" startup behavior. A second process under the same
+dedicated broker UID is outside the supported single-instance deployment and
+must not manipulate the socket directory.
+
 For the first audit segment, omit `audit_initial_previous_hash` to use the
 all-zero genesis. For every rotated segment, set it to the exact final
 `head_sha256` of the preceding segment. The daemon validates this linkage before

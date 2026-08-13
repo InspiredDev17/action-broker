@@ -114,6 +114,18 @@ the health flag and exactly the configured worker count. Any mismatch emits a
 secret-free `sandbox_failure` with reason `connection_worker_lost` and shuts
 down; capacity is never silently degraded or replenished by an ad hoc thread.
 
+The bound socket records its device and inode immediately after creation and
+revalidates both after applying owner/group/mode policy. Its lifetime guard
+removes the pathname on ordinary return and Rust unwinding only when it still
+names that exact socket inode. A replaced socket, regular file, or symlink is
+preserved. The socket directory is broker-owned and not writable by the Platform
+group, so the supported deployment has one writer for this pathname.
+
+Process abort, `SIGKILL`, power loss, and host crash do not run destructors. The
+daemon therefore still refuses every pre-existing pathname at startup rather
+than guessing that a socket is stale. Crash recovery remains an explicit
+operator action after confirming no broker process or listener is active.
+
 The daemon fails closed on platforms where this implementation cannot obtain a
 supported peer UID. A future macOS transport must provide an equally explicit,
 tested principal binding before `serve` is enabled there.

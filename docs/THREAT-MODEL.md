@@ -166,6 +166,12 @@ requires the exact configured live count; return, panic, receiver failure, or
 poisoned synchronization cannot silently reduce capacity. Lost-worker shutdown
 is reported as `connection_worker_lost` when the mandatory event sink remains
 available.
+Socket cleanup is device/inode-bound and refuses to delete a replacement object.
+It is destructor-based and therefore not a crash-consistency guarantee: abort,
+`SIGKILL`, power loss, or host crash can leave a stale socket. Startup refuses
+that pathname until an operator verifies and quarantines it; availability is
+preferred over unsafe automatic unlinking. The supported deployment assumes a
+single broker process under its dedicated UID and a broker-owned socket parent.
 The broker enforces bounded global, per-principal, and per-capability in-flight
 counts. Admission waits are bounded and cancellation-aware. It does not provide
 weighted fairness, persistent queues, or per-principal scheduling guarantees;
