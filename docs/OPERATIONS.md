@@ -444,14 +444,20 @@ private audit files opened without following the final symlink, limits a segment
 to 1 GiB, each record to 256 KiB, and the record count to 4,000,000. It rejects
 unknown JSON fields, unsupported event versions, impossible phase/result or
 approval combinations, invalid digest syntax, finish times before their start,
-missing final newlines, concurrent size changes, chain discontinuity, and
-external-checkpoint mismatch. These semantic checks run before new records are
-appended and again on startup and offline verification. Rotate well before a
-bound is reached; increasing a limit is an administrative review, not an
-incident workaround.
+orphan finishes, overlapping duplicate starts, cross-phase identity or
+authorization mismatch, missing final newlines, concurrent size changes, chain
+discontinuity, and external-checkpoint mismatch. These semantic checks run
+before new records are appended and again on startup and offline verification.
+Rotate well before a bound is reached; increasing a limit is an administrative
+review, not an incident workaround.
 
-Rotation must set `audit_initial_previous_hash` to carry the final hash of the
-previous segment into the next and
+Rotation must occur only after admission stops and active actions drain. An
+unfinished start may remain as truthful crash evidence, but a finish is never
+allowed to cross into another segment. The validator bounds unresolved starts
+at 4,096; reaching that ceiling fails closed and requires reviewed, anchored
+rotation rather than deleting history. Rotation must set
+`audit_initial_previous_hash` to carry the final hash of the previous segment
+into the next and
 must not delete segments before retention/anchoring policy permits. Verify the
 chain:
 

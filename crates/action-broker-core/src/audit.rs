@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
@@ -17,6 +18,7 @@ const AUDIT_EVENT_VERSION: u8 = 1;
 const MAX_AUDIT_LINE_BYTES: usize = 256 * 1024;
 const MAX_AUDIT_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_AUDIT_RECORDS: u64 = 4_000_000;
+const MAX_PENDING_AUDITS: usize = 4_096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -102,8 +104,27 @@ struct AuditWriter {
     previous_hash: String,
     record_count: u64,
     current_bytes: u64,
+    pending: BTreeMap<Uuid, AuditStartBinding>,
     #[cfg(unix)]
     file_stamp: FileStamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuditStartBinding {
+    request_id: Uuid,
+    user_id: String,
+    agent_id: String,
+    task_id: String,
+    capability: String,
+    target: String,
+    validated_arguments_hash: String,
+    approval: ApprovalAudit,
+    started_at_unix_ms: i128,
+}
+
+struct ValidatedAuditChain {
+    summary: AuditVerificationSummary,
+    pending: BTreeMap<Uuid, AuditStartBinding>,
 }
 
 #[cfg(unix)]
@@ -136,7 +157,7 @@ impl HashChainedJsonlAuditSink {
     pub fn open_with_initial_hash(path: &Path, initial_previous_hash: &str) -> BrokerResult<Self> {
         validate_hash(initial_previous_hash, "initial audit head is invalid")?;
         let file = open_audit_file(path, true)?;
-        let summary = validate_existing_chain(&file, initial_previous_hash)?;
+        let validated = validate_existing_chain(&file, initial_previous_hash)?;
         let current_bytes = file
             .metadata()
             .map_err(|_| audit_error("audit log metadata failed"))?
@@ -146,9 +167,10 @@ impl HashChainedJsonlAuditSink {
         Ok(Self {
             state: Mutex::new(AuditWriter {
                 writer: BufWriter::new(file),
-                previous_hash: summary.head_sha256,
-                record_count: summary.record_count,
+                previous_hash: validated.summary.head_sha256,
+                record_count: validated.summary.record_count,
                 current_bytes,
+                pending: validated.pending,
                 #[cfg(unix)]
                 file_stamp,
             }),
@@ -169,7 +191,7 @@ pub fn verify_audit_chain(
         validate_hash(expected, "expected audit head is invalid")?;
     }
     let file = open_audit_file(path, false)?;
-    let summary = validate_existing_chain(&file, initial_previous_hash)?;
+    let summary = validate_existing_chain(&file, initial_previous_hash)?.summary;
     if expected_head.is_some_and(|expected| expected != summary.head_sha256) {
         return Err(audit_error(
             "audit chain head does not match the external checkpoint",
@@ -185,6 +207,7 @@ impl AuditSink for HashChainedJsonlAuditSink {
             .state
             .lock()
             .map_err(|_| audit_error("audit log lock failed"))?;
+        validate_lifecycle_event(&state.pending, event)?;
         let record_hash = compute_record_hash(&state.previous_hash, event)?;
         let record = ChainedAuditEvent {
             previous_hash: state.previous_hash.clone(),
@@ -239,6 +262,7 @@ impl AuditSink for HashChainedJsonlAuditSink {
         state.previous_hash = record_hash;
         state.record_count = state.record_count.saturating_add(1);
         state.current_bytes = durable_bytes;
+        apply_lifecycle_event(&mut state.pending, event);
         #[cfg(unix)]
         {
             state.file_stamp = file_stamp(state.writer.get_ref())?;
@@ -260,7 +284,7 @@ fn compute_record_hash(previous_hash: &str, event: &AuditEvent) -> BrokerResult<
 fn validate_existing_chain(
     file: &File,
     initial_previous_hash: &str,
-) -> BrokerResult<AuditVerificationSummary> {
+) -> BrokerResult<ValidatedAuditChain> {
     let expected_length = file
         .metadata()
         .map_err(|_| audit_error("audit log metadata failed"))?
@@ -274,6 +298,7 @@ fn validate_existing_chain(
     let mut record_count = 0_u64;
     let mut first_event_at_unix_ms = None;
     let mut last_event_at_unix_ms = None;
+    let mut pending = BTreeMap::new();
     let mut reader = BufReader::new(validation_file);
     loop {
         let mut line = Vec::with_capacity(4096);
@@ -294,11 +319,13 @@ fn validate_existing_chain(
         let record: ChainedAuditEvent = serde_json::from_slice(&line)
             .map_err(|_| audit_error("audit chain contains invalid JSON"))?;
         validate_event(&record.event)?;
+        validate_lifecycle_event(&pending, &record.event)?;
         if record.previous_hash != previous
             || compute_record_hash(&previous, &record.event)? != record.record_hash
         {
             return Err(audit_error("audit chain validation failed"));
         }
+        apply_lifecycle_event(&mut pending, &record.event);
         record_count = record_count.saturating_add(1);
         if record_count > MAX_AUDIT_RECORDS {
             return Err(audit_error("audit log exceeds the record count limit"));
@@ -324,13 +351,70 @@ fn validate_existing_chain(
     if file_stamp(file)? != expected_stamp {
         return Err(audit_error("audit log changed during validation"));
     }
-    Ok(AuditVerificationSummary {
-        record_count,
-        initial_previous_sha256: initial_previous_hash.to_owned(),
-        head_sha256: previous,
-        first_event_at_unix_ms,
-        last_event_at_unix_ms,
+    Ok(ValidatedAuditChain {
+        summary: AuditVerificationSummary {
+            record_count,
+            initial_previous_sha256: initial_previous_hash.to_owned(),
+            head_sha256: previous,
+            first_event_at_unix_ms,
+            last_event_at_unix_ms,
+        },
+        pending,
     })
+}
+
+fn validate_lifecycle_event(
+    pending: &BTreeMap<Uuid, AuditStartBinding>,
+    event: &AuditEvent,
+) -> BrokerResult<()> {
+    match event.phase {
+        AuditPhase::Started => {
+            if pending.contains_key(&event.audit_id) {
+                return Err(audit_error("audit action has a duplicate start"));
+            }
+            if pending.len() >= MAX_PENDING_AUDITS {
+                return Err(audit_error("audit segment has too many unfinished actions"));
+            }
+        }
+        AuditPhase::Finished => {
+            let Some(start) = pending.get(&event.audit_id) else {
+                return Err(audit_error("audit finish has no matching start"));
+            };
+            if *start != AuditStartBinding::from(event) {
+                return Err(audit_error("audit finish does not match its start"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn apply_lifecycle_event(pending: &mut BTreeMap<Uuid, AuditStartBinding>, event: &AuditEvent) {
+    match event.phase {
+        AuditPhase::Started => {
+            let prior = pending.insert(event.audit_id, AuditStartBinding::from(event));
+            debug_assert!(prior.is_none(), "lifecycle was validated before append");
+        }
+        AuditPhase::Finished => {
+            let prior = pending.remove(&event.audit_id);
+            debug_assert!(prior.is_some(), "lifecycle was validated before append");
+        }
+    }
+}
+
+impl From<&AuditEvent> for AuditStartBinding {
+    fn from(event: &AuditEvent) -> Self {
+        Self {
+            request_id: event.request_id,
+            user_id: event.user_id.clone(),
+            agent_id: event.agent_id.clone(),
+            task_id: event.task_id.clone(),
+            capability: event.capability.clone(),
+            target: event.target.clone(),
+            validated_arguments_hash: event.validated_arguments_hash.clone(),
+            approval: event.approval.clone(),
+            started_at_unix_ms: event.started_at_unix_ms,
+        }
+    }
 }
 
 fn validate_event(event: &AuditEvent) -> BrokerResult<()> {
@@ -722,6 +806,83 @@ mod tests {
         };
         let mut encoded = serde_json::to_vec(&record)?;
         encoded.push(b'\n');
+        fs::write(&path, encoded)?;
+        assert!(verify_audit_chain(&path, None, None).is_err());
+        assert!(HashChainedJsonlAuditSink::open(&path).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn writer_enforces_bounded_start_finish_pairing() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("audit.jsonl");
+        let sink = HashChainedJsonlAuditSink::open(&path)?;
+        assert!(sink.record(&finished_event()).is_err());
+        assert_eq!(fs::metadata(&path)?.len(), 0);
+
+        let started = event();
+        sink.record(&started)?;
+        assert!(sink.record(&started).is_err());
+        let mut mismatched = finished_event();
+        mismatched.capability = "WriteFile".to_owned();
+        assert!(sink.record(&mismatched).is_err());
+        sink.record(&finished_event())?;
+        assert!(sink.record(&finished_event()).is_err());
+
+        let summary = verify_audit_chain(&path, None, None)?;
+        assert_eq!(summary.record_count, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn pending_audit_limit_is_exact_and_releases_on_finish() -> BrokerResult<()> {
+        let mut pending = BTreeMap::new();
+        for index in 0..MAX_PENDING_AUDITS {
+            let mut started = event();
+            started.audit_id = Uuid::from_u128(index as u128 + 1);
+            validate_lifecycle_event(&pending, &started)?;
+            apply_lifecycle_event(&mut pending, &started);
+        }
+        assert_eq!(pending.len(), MAX_PENDING_AUDITS);
+
+        let mut denied = event();
+        denied.audit_id = Uuid::from_u128(MAX_PENDING_AUDITS as u128 + 1);
+        assert!(validate_lifecycle_event(&pending, &denied).is_err());
+
+        let mut finished = finished_event();
+        finished.audit_id = Uuid::from_u128(1);
+        validate_lifecycle_event(&pending, &finished)?;
+        apply_lifecycle_event(&mut pending, &finished);
+        validate_lifecycle_event(&pending, &denied)?;
+        Ok(())
+    }
+
+    #[test]
+    fn verifier_rejects_correctly_hashed_cross_record_mismatch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("audit.jsonl");
+        let start = event();
+        let start_hash = compute_record_hash(GENESIS_HASH, &start)?;
+        let mut finish = finished_event();
+        finish.task_id = "different-task".to_owned();
+        let records = [
+            ChainedAuditEvent {
+                previous_hash: GENESIS_HASH.to_owned(),
+                record_hash: start_hash.clone(),
+                event: start,
+            },
+            ChainedAuditEvent {
+                previous_hash: start_hash.clone(),
+                record_hash: compute_record_hash(&start_hash, &finish)?,
+                event: finish,
+            },
+        ];
+        let mut encoded = Vec::new();
+        for record in records {
+            serde_json::to_writer(&mut encoded, &record)?;
+            encoded.push(b'\n');
+        }
         fs::write(&path, encoded)?;
         assert!(verify_audit_chain(&path, None, None).is_err());
         assert!(HashChainedJsonlAuditSink::open(&path).is_err());

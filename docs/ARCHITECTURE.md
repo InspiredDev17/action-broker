@@ -206,7 +206,10 @@ Audit parsing is strict and bounded. The writer, startup, and the read-only
 `verify-audit` operator command share semantic validation that rejects
 unsupported event versions, impossible phase/result combinations,
 inconsistent approval metadata, invalid digests, and finish times before their
-start. They also reject unknown fields, oversized or incomplete records,
+start. A bounded lifecycle state machine rejects orphan finishes and
+overlapping duplicate starts and requires each finish to match its start's
+requester, task, capability, target, argument hash, approval metadata, and
+start time. They also reject unknown fields, oversized or incomplete records,
 symlinks, same-path object replacement, broken hashes, and files that change
 during validation. A rotated segment is configured with the exact final head
 of its predecessor; genesis is valid only for the first segment.
