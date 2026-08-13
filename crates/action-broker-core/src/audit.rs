@@ -31,6 +31,10 @@ pub struct ApprovalAudit {
     pub approval_type: Option<String>,
     pub token_digest: Option<String>,
     pub key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nonce_digest_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix_seconds: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -440,6 +444,8 @@ mod tests {
                 approval_type: None,
                 token_digest: None,
                 key_id: None,
+                nonce_digest_sha256: None,
+                expires_at_unix_seconds: None,
             },
             started_at_unix_ms: 1,
             finished_at_unix_ms: None,
@@ -449,6 +455,33 @@ mod tests {
             files_changed: Vec::new(),
             network_destinations: Vec::new(),
         }
+    }
+
+    #[test]
+    fn legacy_approval_shape_remains_canonical() -> Result<(), Box<dyn std::error::Error>> {
+        let approval = event().approval;
+        let encoded = serde_jcs::to_vec(&approval)?;
+        assert_eq!(
+            encoded,
+            br#"{"approval_type":null,"key_id":null,"required":false,"token_digest":null}"#
+        );
+        assert!(
+            !encoded
+                .windows(b"nonce".len())
+                .any(|value| value == b"nonce")
+        );
+        assert!(
+            !encoded
+                .windows(b"expires_at".len())
+                .any(|value| value == b"expires_at")
+        );
+
+        let legacy_approved = br#"{"approval_type":"ElevatedUser","key_id":"legacy-key","required":true,"token_digest":"legacy-token-digest"}"#;
+        let parsed: ApprovalAudit = serde_json::from_slice(legacy_approved)?;
+        assert_eq!(parsed.nonce_digest_sha256, None);
+        assert_eq!(parsed.expires_at_unix_seconds, None);
+        assert_eq!(serde_jcs::to_vec(&parsed)?, legacy_approved);
+        Ok(())
     }
 
     #[test]

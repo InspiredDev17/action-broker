@@ -379,6 +379,13 @@ Monitor at least:
 - DNS answer changes, redirect denials, and effective destination traces; and
 - clock health and deviation beyond approval skew policy.
 
+For approval incident correlation, use the audit record's verified key ID,
+token digest, nonce digest, and signed expiration. These fields allow operators
+to group executions and ledger evidence without placing bearer tokens or raw
+nonces in logs. A nonce digest appears only for a successfully verified and
+consumed approval; rejected approvals produce Agent Green reason codes but no
+audit start.
+
 Metrics and alerts must use bounded identifiers and reason codes. Do not put raw
 arguments, file contents, command output, HTTP bodies, approval envelopes,
 credentials, or query tokens in metric labels or logs.

@@ -341,6 +341,13 @@ wait_for_probe() {
   ((status == 0)) || fail "$label exited with status $status"
 }
 
+sha256_text() {
+  local value=$1
+  local digest
+  read -r digest _ < <(printf '%s' "$value" | sha256sum)
+  printf '%s\n' "$digest"
+}
+
 start_daemon() {
   : >"$daemon_log"
   setpriv \
@@ -462,6 +469,10 @@ setpriv --reuid "$platform_uid" --regid "$ipc_gid" --clear-groups \
 chown "$platform_uid:$ipc_gid" "$command_request"
 chmod 0600 "$command_request"
 "$bin_dir/issue-lifecycle-approval" verify "$command_request"
+command_issued_at=$("$bin_dir/issue-lifecycle-approval" issued-at "$command_request")
+command_expires_at=$((command_issued_at + 60))
+command_nonce_digest=$(sha256_text 'lifecycle-command-nonce-0001')
+readonly command_issued_at command_expires_at command_nonce_digest
 setpriv --reuid "$platform_uid" --regid "$ipc_gid" --clear-groups \
   env -i "$bin_dir/lifecycletestclient" \
   --mode normalize-request --request "$command_request" \
@@ -504,12 +515,19 @@ command_client_pid=''
 if pgrep -u "$broker_uid" -x sleep >/dev/null 2>&1; then
   fail 'sandboxed approved command survived broker shutdown'
 fi
-jq -e -s --arg request_id "$command_request_id" '
+jq -e -s --arg request_id "$command_request_id" \
+  --arg nonce_digest "$command_nonce_digest" \
+  --argjson expires_at "$command_expires_at" '
   any(.[]; .event.request_id == $request_id and .event.phase == "started" and
     .event.approval.required == true and .event.approval.approval_type == "ElevatedUser" and
-    .event.approval.key_id == "lifecycle-test-key") and
+    .event.approval.key_id == "lifecycle-test-key" and
+    .event.approval.nonce_digest_sha256 == $nonce_digest and
+    .event.approval.expires_at_unix_seconds == $expires_at and
+    (.event.approval.token_digest | length == 64)) and
   any(.[]; .event.request_id == $request_id and .event.phase == "finished" and
-    .event.error_code == "cancelled")
+    .event.error_code == "cancelled" and
+    .event.approval.nonce_digest_sha256 == $nonce_digest and
+    .event.approval.expires_at_unix_seconds == $expires_at)
 ' "$audit_path" >/dev/null
 
 # Reopen the durable replay ledger, submit the exact consumed token again, and

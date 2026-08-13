@@ -224,9 +224,12 @@ Compromise response includes:
 ## Audit and secret handling
 
 Audit records include whether approval was required, its verified key ID,
-approval type, and a SHA-256 digest of the compact token for correlation. They
-do not currently record a separate nonce digest or token expiry. They never
-include signing keys, full bearer tokens,
+approval type, token expiration, and separate SHA-256 digests of the compact
+token and validated nonce for correlation. The nonce digest is derived only
+after successful signature, binding, lifecycle, and replay verification; raw
+nonces are not audit fields. Legacy version-1 records without the two optional
+forensic fields remain hash-verifiable. Audit records never include signing
+keys, full bearer tokens,
 signatures, secrets embedded in inputs, or raw approval-service responses.
 
 Approval tampering, invalid binding, expiry, replay, and permission bypass

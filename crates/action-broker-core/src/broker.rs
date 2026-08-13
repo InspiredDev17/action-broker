@@ -571,6 +571,9 @@ fn approval_audit(request: &ActionRequest, approval: Option<&VerifiedApproval>) 
             .as_deref()
             .map(|token| hex::encode(Sha256::digest(token.as_bytes()))),
         key_id: approval.map(|value| value.key_id.clone()),
+        nonce_digest_sha256: approval
+            .map(|value| hex::encode(Sha256::digest(value.claims.nonce.as_bytes()))),
+        expires_at_unix_seconds: approval.map(|value| value.claims.expires_at_unix_seconds),
     }
 }
 
@@ -784,7 +787,10 @@ mod tests {
     use std::thread;
 
     use super::*;
-    use crate::capability::{CapabilityAction, ReadFileInput, RootedPath};
+    use crate::approval::{APPROVAL_TOKEN_VERSION, ApprovalClaimsV1};
+    use crate::capability::{
+        ApprovalType, CapabilityAction, CapabilityKind, ReadFileInput, RootedPath,
+    };
     use crate::model::{ExecutionTarget, RequesterIdentity};
 
     struct FailingSecurityEventSink;
@@ -812,6 +818,69 @@ mod tests {
                 "test sink failure",
             ))
         }
+    }
+
+    #[test]
+    fn verified_approval_audit_records_bounded_forensic_fields()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let token = "opaque-signed-token";
+        let nonce = "nonce-forensic-0001";
+        let expires_at = 1_900_000_000;
+        let request = ActionRequest {
+            protocol_version: ACTION_BROKER_PROTOCOL_VERSION,
+            request_id: Uuid::nil(),
+            requester: RequesterIdentity {
+                user_id: "user".to_owned(),
+                agent_id: "agent".to_owned(),
+                task_id: "task".to_owned(),
+            },
+            target: ExecutionTarget::Local,
+            action: CapabilityAction::ReadFile(ReadFileInput {
+                path: RootedPath {
+                    root_id: "workspace".to_owned(),
+                    relative_path: "file".to_owned(),
+                },
+                maximum_bytes: 1,
+            }),
+            approval_token: Some(token.to_owned()),
+        };
+        let approval = VerifiedApproval {
+            key_id: "approval-key".to_owned(),
+            claims: ApprovalClaimsV1 {
+                version: APPROVAL_TOKEN_VERSION,
+                request_id: request.request_id,
+                user_id: request.requester.user_id.clone(),
+                agent_id: request.requester.agent_id.clone(),
+                task_id: request.requester.task_id.clone(),
+                capability: CapabilityKind::ReadFile,
+                arguments_digest_sha256: request.arguments_digest()?,
+                target_digest_sha256: request.target_digest()?,
+                target: request.target.clone(),
+                issued_at_unix_seconds: expires_at - 60,
+                expires_at_unix_seconds: expires_at,
+                approval_type: ApprovalType::ExplicitUser,
+                nonce: nonce.to_owned(),
+            },
+        };
+
+        let audit = approval_audit(&request, Some(&approval));
+        let expected_nonce_digest = hex::encode(Sha256::digest(nonce.as_bytes()));
+        let expected_token_digest = hex::encode(Sha256::digest(token.as_bytes()));
+        assert!(audit.required);
+        assert_eq!(audit.key_id.as_deref(), Some("approval-key"));
+        assert_eq!(audit.expires_at_unix_seconds, Some(expires_at));
+        assert_eq!(
+            audit.nonce_digest_sha256.as_deref(),
+            Some(expected_nonce_digest.as_str())
+        );
+        assert_eq!(
+            audit.token_digest.as_deref(),
+            Some(expected_token_digest.as_str())
+        );
+        let encoded = serde_json::to_string(&audit)?;
+        assert!(!encoded.contains(nonce));
+        assert!(!encoded.contains(token));
+        Ok(())
     }
 
     #[test]
