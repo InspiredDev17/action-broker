@@ -161,6 +161,11 @@ misclassified as malicious request input.
 Mandatory event failure marks the fixed worker pool unhealthy and the listener
 terminates rather than continuing with reduced monitoring. Fatal accept errors
 also emit a secret-free `sandbox_failure` before daemon shutdown.
+Every fixed connection worker has an unwind-safe liveness guard. Readiness
+requires the exact configured live count; return, panic, receiver failure, or
+poisoned synchronization cannot silently reduce capacity. Lost-worker shutdown
+is reported as `connection_worker_lost` when the mandatory event sink remains
+available.
 The broker enforces bounded global, per-principal, and per-capability in-flight
 counts. Admission waits are bounded and cancellation-aware. It does not provide
 weighted fairness, persistent queues, or per-principal scheduling guarantees;

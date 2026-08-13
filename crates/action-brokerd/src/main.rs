@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -195,7 +195,21 @@ struct ConnectionJob {
 struct ConnectionWorkerPool {
     sender: SyncSender<ConnectionJob>,
     healthy: Arc<AtomicBool>,
+    active_workers: Arc<AtomicUsize>,
+    expected_workers: usize,
     _workers: Vec<thread::JoinHandle<()>>,
+}
+
+struct WorkerLivenessGuard {
+    healthy: Arc<AtomicBool>,
+    active_workers: Arc<AtomicUsize>,
+}
+
+impl Drop for WorkerLivenessGuard {
+    fn drop(&mut self) {
+        self.active_workers.fetch_sub(1, Ordering::AcqRel);
+        self.healthy.store(false, Ordering::Release);
+    }
 }
 
 #[derive(Clone)]
@@ -222,6 +236,7 @@ impl ConnectionWorkerPool {
             Duration::from_millis(limits.protocol_failure_window_milliseconds),
         )));
         let healthy = Arc::new(AtomicBool::new(true));
+        let active_workers = Arc::new(AtomicUsize::new(limits.worker_threads));
         let maximum_queue_wait = Duration::from_millis(limits.maximum_queue_wait_milliseconds);
         let read_timeout = Duration::from_millis(limits.read_timeout_milliseconds);
         let write_timeout = Duration::from_millis(limits.write_timeout_milliseconds);
@@ -238,9 +253,15 @@ impl ConnectionWorkerPool {
         for worker_index in 0..limits.worker_threads {
             let receiver = Arc::clone(&receiver);
             let runtime = runtime.clone();
+            let worker_active_workers = Arc::clone(&active_workers);
+            let worker_healthy = Arc::clone(&healthy);
             let worker = thread::Builder::new()
                 .name(format!("action-broker-connection-{worker_index}"))
                 .spawn(move || {
+                    let _liveness = WorkerLivenessGuard {
+                        healthy: worker_healthy,
+                        active_workers: worker_active_workers,
+                    };
                     connection_worker(receiver, runtime);
                 })
                 .map_err(|_| {
@@ -251,6 +272,8 @@ impl ConnectionWorkerPool {
         Ok(Self {
             sender,
             healthy,
+            active_workers,
+            expected_workers: limits.worker_threads,
             _workers: workers,
         })
     }
@@ -260,8 +283,16 @@ impl ConnectionWorkerPool {
     }
 
     fn is_healthy(&self) -> bool {
-        self.healthy.load(Ordering::Acquire)
+        worker_pool_is_healthy(
+            self.healthy.load(Ordering::Acquire),
+            self.active_workers.load(Ordering::Acquire),
+            self.expected_workers,
+        )
     }
+}
+
+fn worker_pool_is_healthy(healthy: bool, active_workers: usize, expected_workers: usize) -> bool {
+    healthy && active_workers == expected_workers
 }
 
 fn connection_worker(
@@ -535,9 +566,10 @@ fn serve(config_path: &Path) -> Result<(), BrokerError> {
         .map_err(|_| transport_error("Unix socket nonblocking setup failed"))?;
     loop {
         if !worker_pool.is_healthy() {
+            emit_worker_pool_failure(security_events.as_ref())?;
             return Err(BrokerError::new(
-                ErrorCode::SecurityEventFailure,
-                "connection worker mandatory security event reporting failed",
+                ErrorCode::SandboxFailure,
+                "connection worker pool lost required capacity",
             ));
         }
         let stream = match listener.accept() {
@@ -960,6 +992,13 @@ fn emit_socket_accept_failure(security_events: &dyn SecurityEventSink) -> Result
     ))
 }
 
+fn emit_worker_pool_failure(security_events: &dyn SecurityEventSink) -> Result<(), BrokerError> {
+    security_events.emit(&SecurityEvent::new(
+        SecurityEventKind::SandboxFailure,
+        "connection_worker_lost",
+    ))
+}
+
 fn report_transport_authentication_failure(
     security_events: &dyn SecurityEventSink,
     failure_gate: &mut FailureWindowGate,
@@ -1148,7 +1187,6 @@ fn protocol_rejection(reason_code: &'static str) -> ProtocolRejection {
 mod tests {
     use std::error::Error;
     use std::sync::Barrier;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
 
@@ -1681,6 +1719,58 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, SecurityEventKind::SandboxFailure);
         assert_eq!(events[0].reason_code, "socket_accept_failure");
+        assert!(events[0].request_id.is_none());
+        assert!(events[0].user_id.is_none());
+        assert!(events[0].target_digest.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn worker_liveness_guard_detects_return_and_unwind() {
+        for unwind in [false, true] {
+            let healthy = Arc::new(AtomicBool::new(true));
+            let active_workers = Arc::new(AtomicUsize::new(1));
+            let guard = WorkerLivenessGuard {
+                healthy: Arc::clone(&healthy),
+                active_workers: Arc::clone(&active_workers),
+            };
+            if unwind {
+                let outcome = std::panic::catch_unwind(move || {
+                    let _guard = guard;
+                    std::panic::resume_unwind(Box::new("test worker unwind"));
+                });
+                assert!(outcome.is_err());
+            } else {
+                drop(guard);
+            }
+            assert!(!healthy.load(Ordering::Acquire));
+            assert_eq!(active_workers.load(Ordering::Acquire), 0);
+            assert!(!worker_pool_is_healthy(
+                healthy.load(Ordering::Acquire),
+                active_workers.load(Ordering::Acquire),
+                1,
+            ));
+        }
+    }
+
+    #[test]
+    fn worker_pool_health_requires_exact_configured_count() {
+        assert!(worker_pool_is_healthy(true, 4, 4));
+        assert!(!worker_pool_is_healthy(true, 3, 4));
+        assert!(!worker_pool_is_healthy(true, 5, 4));
+        assert!(!worker_pool_is_healthy(false, 4, 4));
+    }
+
+    #[test]
+    fn worker_pool_failure_emits_secret_free_sandbox_event() -> Result<(), Box<dyn Error>> {
+        let sink = RecordingSecurityEventSink {
+            events: Mutex::new(Vec::new()),
+        };
+        emit_worker_pool_failure(&sink)?;
+        let events = sink.events.lock().map_err(|_| "event lock")?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, SecurityEventKind::SandboxFailure);
+        assert_eq!(events[0].reason_code, "connection_worker_lost");
         assert!(events[0].request_id.is_none());
         assert!(events[0].user_id.is_none());
         assert!(events[0].target_digest.is_none());

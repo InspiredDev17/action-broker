@@ -98,6 +98,8 @@ Action Broker is designed to fail closed:
   parsing and produce bounded, secret-free Agent Green bypass events;
 - malformed, truncated, oversized, and schema-invalid authenticated frames emit
   bounded protocol-abuse events before broker authorization or execution;
+- exact worker-liveness accounting terminates the daemon if any configured
+  connection worker returns or unwinds unexpectedly;
 - daemon readiness and every action verify exact real/effective/saved/fs IDs,
   supplementary groups, empty active Linux capability sets, and inherited
   `NoNewPrivs`; and

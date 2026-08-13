@@ -107,6 +107,13 @@ detects that state within the poll interval and terminates the daemon. A fatal
 socket-accept error emits `sandbox_failure` before shutdown. The broker does not
 continue accepting actions with a partially disabled Agent Green path.
 
+Each configured connection worker owns a lifetime guard backed by a shared
+atomic live-worker count. The guard poisons pool health and decrements the count
+on every exit path, including stack unwinding. Listener readiness requires both
+the health flag and exactly the configured worker count. Any mismatch emits a
+secret-free `sandbox_failure` with reason `connection_worker_lost` and shuts
+down; capacity is never silently degraded or replenished by an ad hoc thread.
+
 The daemon fails closed on platforms where this implementation cannot obtain a
 supported peer UID. A future macOS transport must provide an equally explicit,
 tested principal binding before `serve` is enabled there.

@@ -215,6 +215,14 @@ A fatal listener accept error emits `sandbox_failure` with reason
 `socket_accept_failure` and terminates. Treat any such shutdown as a service
 health failure requiring storage or socket repair before restart.
 
+Worker readiness additionally requires the exact configured live-worker count.
+Every worker return or unwind atomically decrements that count and poisons the
+pool, even if the exit was not one of the anticipated error branches. The
+listener emits `sandbox_failure` with reason `connection_worker_lost` and exits
+within its 10 millisecond health interval. Configure the service manager to
+restart only after retaining the Agent Green spool and crash diagnostics; do not
+mask repeated exits by dynamically adding unreviewed worker threads.
+
 For the first audit segment, omit `audit_initial_previous_hash` to use the
 all-zero genesis. For every rotated segment, set it to the exact final
 `head_sha256` of the preceding segment. The daemon validates this linkage before
