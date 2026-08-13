@@ -179,6 +179,14 @@ claims validation but before nonce consumption, so an inactive, retired, or
 revoked key cannot authorize execution and an invalid lifecycle attempt cannot
 burn a nonce.
 
+The operated Linux lifecycle qualifies the hard-revocation path with two
+test-only keys. After the daemon stops, it installs a root-owned cutoff later
+than both signed tokens' issuance times. A primary-key token is rejected after
+restart without execution or audit start; the identical request ID, arguments,
+target, and nonce under the active replacement key remains usable exactly once.
+This is test evidence for restart-based revocation and global nonce ordering,
+not authority to restore a revoked key or reuse these embedded keys.
+
 Key IDs are unique within a configuration; duplicate IDs, negative activation,
 and retirement/revocation instants at or before activation fail startup. Rotation
 lists old and new public keys simultaneously with non-overlapping issuance

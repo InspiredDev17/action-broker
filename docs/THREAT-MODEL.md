@@ -69,9 +69,13 @@ request remains usable, proving none of those failures consumed the nonce. The
 harness proves first-signal cancellation and descendant termination, then
 reopens the durable ledger and proves the consumed token is rejected before a
 second audit start or process launch, with mandatory `replayed_approval`
-evidence. The embedded fixture key is not production authority. This still does
-not qualify general approved-command isolation, cgroup containment, production
-filesystem mounts, or external side-effect recovery.
+evidence. Finally, it stops the daemon, installs a root-owned revocation cutoff
+later than two tokens' issuance times, and restarts. The revoked primary-key
+token fails without an audit start; the identical request and nonce signed by
+the active replacement key executes once and becomes durable replay state. The
+embedded fixture keys are not production authority. This still does not qualify
+general approved-command isolation, cgroup containment, production filesystem
+mounts, or external side-effect recovery.
 
 ## Threats, controls, and residual risk
 

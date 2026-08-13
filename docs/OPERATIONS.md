@@ -305,9 +305,14 @@ nonce. The harness sends
 under the broker test UID survives. After reopening the same SQLite ledger, it
 resubmits that exact token and requires a broker-confirmed `approval_replayed`
 rejection, no second command or audit start, and mandatory Agent Green
-identity/capability evidence.
-The embedded fixture signing key must never appear in production trust
-configuration; its binary is excluded from normal builds unless the
+identity/capability evidence. It then stops execution, atomically installs a
+root-owned hard-revocation cutoff later than two test tokens' issuance times,
+and restarts. The primary-key token must fail generically with no process or
+audit start; the same request and nonce under the active replacement key must
+execute once, cancel cleanly, and reject replay after another restart. This
+proves the revoked-key denial did not consume the shared nonce.
+The embedded fixture signing keys must never appear in production trust
+configuration; the issuer binary is excluded from normal builds unless the
 `lifecycle-test-fixture` feature is explicitly enabled. A pass qualifies this
 narrow lifecycle on the tested Linux host only; it does not attest cgroups,
 seccomp, general command containment, external effects, or the production

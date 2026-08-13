@@ -134,6 +134,7 @@ chmod 0644 "$action_root/probe.txt"
 readonly socket_path="$socket_dir/action-broker.sock"
 readonly config_path="$config_dir/action-broker.json"
 readonly key_path="$config_dir/approval-public-key.hex"
+readonly replacement_key_path="$config_dir/replacement-approval-public-key.hex"
 readonly audit_path="$state_dir/audit.jsonl"
 readonly event_path="$state_dir/agent-green.jsonl"
 readonly daemon_log="$test_root/daemon.log"
@@ -143,14 +144,20 @@ readonly expired_command_request="$control_dir/expired-command-request.json"
 readonly future_command_request="$control_dir/future-command-request.json"
 readonly insufficient_approval_request="$control_dir/insufficient-approval-request.json"
 readonly tampered_command_request="$control_dir/tampered-command-request.json"
+readonly revoked_command_request="$control_dir/revoked-command-request.json"
+readonly replacement_command_request="$control_dir/replacement-command-request.json"
 readonly normalized_command_request="$test_root/normalized-command-request.json"
 readonly command_request_id='018f47d2-60d2-7af0-bc35-2a1f7f5a6d02'
+readonly replacement_request_id='018f47d2-60d2-7af0-bc35-2a1f7f5a6d03'
 
-# This public key belongs only to the example fixture issuer. Production must
-# never trust it; the corresponding test seed is absent from daemon config.
+# These public keys belong only to the example fixture issuer. Production must
+# never trust them; the corresponding test seeds are absent from daemon config.
 "$bin_dir/issue-lifecycle-approval" public-key >"$key_path"
+"$bin_dir/issue-lifecycle-approval" replacement-public-key >"$replacement_key_path"
 chmod 0644 "$key_path"
+chmod 0644 "$replacement_key_path"
 chown 0:0 "$key_path"
+chown 0:0 "$replacement_key_path"
 
 bwrap_path=$(realpath "$(command -v bwrap)")
 prlimit_path=$(realpath "$(command -v prlimit)")
@@ -169,6 +176,7 @@ jq -n \
   --arg audit "$audit_path" \
   --arg events "$event_path" \
   --arg key "$key_path" \
+  --arg replacement_key "$replacement_key_path" \
   --arg action_root "$action_root" \
   --arg bwrap "$bwrap_path" \
   --arg bwrap_hash "$bwrap_hash" \
@@ -191,13 +199,22 @@ jq -n \
     audit_initial_previous_hash: null,
     agent_green_event_spool_path: $events,
     agent_green_event_spool_maximum_bytes: 1048576,
-    approval_keys: [{
-      key_id: "lifecycle-test-key",
-      public_key_path: $key,
-      active_from_unix_seconds: 0,
-      retire_at_unix_seconds: null,
-      revoke_at_unix_seconds: null
-    }],
+    approval_keys: [
+      {
+        key_id: "lifecycle-test-key",
+        public_key_path: $key,
+        active_from_unix_seconds: 0,
+        retire_at_unix_seconds: null,
+        revoke_at_unix_seconds: null
+      },
+      {
+        key_id: "lifecycle-replacement-key",
+        public_key_path: $replacement_key,
+        active_from_unix_seconds: 0,
+        retire_at_unix_seconds: null,
+        revoke_at_unix_seconds: null
+      }
+    ],
     approval_verifier: {maximum_ttl_seconds: 300, allowed_clock_skew_seconds: 5, maximum_payload_bytes: 16384},
     policy: {
       grants: [{user_id: "lifecycle-user", agent_id: "lifecycle-agent", permissions: ["filesystem_read", "command_execute_approved"]}],
@@ -275,9 +292,10 @@ wait_for_file() {
 }
 
 wait_for_command_start() {
+  local request_id=${1:-$command_request_id}
   local attempt
   for ((attempt = 0; attempt < SOCKET_WAIT_ATTEMPTS; attempt += 1)); do
-    if jq -e --arg request_id "$command_request_id" \
+    if jq -e --arg request_id "$request_id" \
       'select(.event.request_id == $request_id and .event.phase == "started" and .event.capability == "ExecuteApprovedCommand")' \
       "$audit_path" >/dev/null 2>&1; then
       return 0
@@ -411,7 +429,7 @@ audit_summary=$("$bin_dir/action-brokerd" verify-audit --path "$audit_path")
 jq -e '.record_count == 2 and (.head_sha256 | length == 64)' <<<"$audit_summary" >/dev/null
 
 # Issue an exact currently valid approval using the same Rust request and JCS
-# model as the broker. The private test seed exists only in the fixture binary.
+# model as the broker. The private test seeds exist only in the fixture binary.
 setpriv --reuid "$platform_uid" --regid "$ipc_gid" --clear-groups \
   env -i "$bin_dir/issue-lifecycle-approval" request \
   "$command_request_id" lifecycle-sleep lifecycle . 30000 lifecycle-command-nonce-0001 \
@@ -488,6 +506,97 @@ jq -e -s --arg request_id "$command_request_id" '
 audit_summary=$("$bin_dir/action-brokerd" verify-audit --path "$audit_path")
 jq -e '.record_count == 4 and (.head_sha256 | length == 64)' <<<"$audit_summary" >/dev/null
 
+# Stop execution while installing a root-owned hard-revocation cutoff. Tokens
+# under the revoked key must fail after restart, while the active replacement
+# key may authorize the exact same request ID, arguments, and nonce.
+stop_daemon_cleanly
+setpriv --reuid "$platform_uid" --regid "$ipc_gid" --clear-groups \
+  env -i "$bin_dir/issue-lifecycle-approval" request \
+  "$replacement_request_id" lifecycle-sleep lifecycle . 30000 lifecycle-revocation-nonce-0001 \
+  >"$revoked_command_request"
+setpriv --reuid "$platform_uid" --regid "$ipc_gid" --clear-groups \
+  env -i "$bin_dir/issue-lifecycle-approval" replacement-request \
+  "$replacement_request_id" lifecycle-sleep lifecycle . 30000 lifecycle-revocation-nonce-0001 \
+  >"$replacement_command_request"
+chown "$platform_uid:$ipc_gid" "$revoked_command_request" "$replacement_command_request"
+chmod 0600 "$revoked_command_request" "$replacement_command_request"
+primary_issued_at=$("$bin_dir/issue-lifecycle-approval" issued-at "$revoked_command_request")
+replacement_issued_at=$("$bin_dir/issue-lifecycle-approval" issued-at "$replacement_command_request")
+last_issued_at=$primary_issued_at
+((replacement_issued_at > last_issued_at)) && last_issued_at=$replacement_issued_at
+while (( $(date +%s) <= last_issued_at )); do
+  sleep "$SOCKET_WAIT_INTERVAL"
+done
+revocation_cutoff=$(date +%s)
+readonly revocation_cutoff
+((primary_issued_at < revocation_cutoff)) || fail 'primary approval was not issued before revocation'
+((replacement_issued_at < revocation_cutoff)) || fail 'replacement approval was not issued before revocation'
+revoked_config="$config_dir/action-broker-revoked.json"
+jq --argjson cutoff "$revocation_cutoff" '
+  (.approval_keys[] | select(.key_id == "lifecycle-test-key") | .revoke_at_unix_seconds) = $cutoff
+' "$config_path" >"$revoked_config"
+chmod 0644 "$revoked_config"
+chown 0:0 "$revoked_config"
+mv "$revoked_config" "$config_path"
+
+start_daemon
+setpriv --reuid "$platform_uid" --regid "$ipc_gid" --clear-groups \
+  env -i "$bin_dir/lifecycletestclient" \
+  --mode execute-and-expect-approval-invalid --socket "$socket_path" --broker-uid "$broker_uid" \
+  --request "$revoked_command_request" --timeout 5s
+if pgrep -u "$broker_uid" -x sleep >/dev/null 2>&1; then
+  fail 'revoked approval started a sandboxed command'
+fi
+jq -e -s --arg request_id "$replacement_request_id" '
+  [.[] | select(.kind == "approval_tampering" and .request_id == $request_id and
+    .reason_code == "approval_invalid" and .user_id == "lifecycle-user" and
+    .agent_id == "lifecycle-agent" and .task_id == "lifecycle-command-cancellation" and
+    .capability == "ExecuteApprovedCommand" and (.target_digest | length == 64))] | length == 1
+' "$event_path" >/dev/null
+audit_summary=$("$bin_dir/action-brokerd" verify-audit --path "$audit_path")
+jq -e '.record_count == 4 and (.head_sha256 | length == 64)' <<<"$audit_summary" >/dev/null
+
+setpriv --reuid "$platform_uid" --regid "$ipc_gid" --clear-groups \
+  env -i "$bin_dir/lifecycletestclient" \
+  --mode execute-and-expect-cancel --socket "$socket_path" --broker-uid "$broker_uid" \
+  --request "$replacement_command_request" --timeout 10s &
+command_client_pid=$!
+wait_for_command_start "$replacement_request_id"
+wait_for_sleep_process
+stop_daemon_cleanly
+wait "$command_client_pid"
+command_client_pid=''
+if pgrep -u "$broker_uid" -x sleep >/dev/null 2>&1; then
+  fail 'replacement-key command survived broker shutdown'
+fi
+jq -e -s --arg request_id "$replacement_request_id" '
+  any(.[]; .event.request_id == $request_id and .event.phase == "started" and
+    .event.approval.required == true and .event.approval.approval_type == "ElevatedUser" and
+    .event.approval.key_id == "lifecycle-replacement-key") and
+  any(.[]; .event.request_id == $request_id and .event.phase == "finished" and
+    .event.error_code == "cancelled")
+' "$audit_path" >/dev/null
+
+# Reopen the same state and prove the replacement approval was consumed exactly
+# once; the prior revoked-key rejection did not create an audit record or burn
+# the shared nonce.
+start_daemon
+setpriv --reuid "$platform_uid" --regid "$ipc_gid" --clear-groups \
+  env -i "$bin_dir/lifecycletestclient" \
+  --mode execute-and-expect-replay --socket "$socket_path" --broker-uid "$broker_uid" \
+  --request "$replacement_command_request" --timeout 5s
+if pgrep -u "$broker_uid" -x sleep >/dev/null 2>&1; then
+  fail 'replayed replacement approval started a sandboxed command'
+fi
+jq -e -s --arg request_id "$replacement_request_id" '
+  any(.[]; .kind == "replayed_approval" and .request_id == $request_id and
+    .reason_code == "approval_replayed" and .user_id == "lifecycle-user" and
+    .agent_id == "lifecycle-agent" and .task_id == "lifecycle-command-cancellation" and
+    .capability == "ExecuteApprovedCommand" and (.target_digest | length == 64))
+' "$event_path" >/dev/null
+audit_summary=$("$bin_dir/action-brokerd" verify-audit --path "$audit_path")
+jq -e '.record_count == 6 and (.head_sha256 | length == 64)' <<<"$audit_summary" >/dev/null
+
 # Hold one authenticated worker in the real framed-read path, then request a
 # first-signal shutdown. The configured read deadline is shorter than the drain
 # grace, so the connection is classified, recorded, and closed before exit.
@@ -504,7 +613,7 @@ hold_pid=''
 jq -e -s 'any(.[]; .kind == "permission_bypass_attempt" and .reason_code == "unauthorized_platform_peer")' "$event_path" >/dev/null
 jq -e -s 'any(.[]; .kind == "resource_abuse_pattern" and .reason_code == "request_frame_incomplete")' "$event_path" >/dev/null
 audit_summary=$("$bin_dir/action-brokerd" verify-audit --path "$audit_path")
-jq -e '.record_count == 4 and (.head_sha256 | length == 64)' <<<"$audit_summary" >/dev/null
+jq -e '.record_count == 6 and (.head_sha256 | length == 64)' <<<"$audit_summary" >/dev/null
 
 # Reopen the same replay ledger, audit chain, and Agent Green spool, then prove
 # that a second clean lifecycle can bind and remove the same socket pathname.

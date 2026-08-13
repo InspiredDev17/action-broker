@@ -182,10 +182,11 @@ mandatory unauthorized-peer evidence, an interrupted partial-frame drain,
 not-yet-valid/expired approval, insufficient approval strength, and
 signed-arguments-tamper rejection without nonce consumption, approved-command
 cancellation with no surviving child, socket cleanup, post-restart rejection of
-the consumed approval, mandatory approval-policy/tamper/replay evidence,
+the consumed approval, hard revocation followed by same-nonce replacement-key
+execution, mandatory approval-policy/tamper/revocation/replay evidence,
 audit-chain verification, and clean restarts against the same durable state.
 The issuer is excluded from normal builds behind the explicit
-`lifecycle-test-fixture` feature and embeds a test key that must never be trusted
+`lifecycle-test-fixture` feature and embeds test keys that must never be trusted
 by a production broker. The harness requires Linux, root for creating
 disposable identities, and the tools it checks at startup. Unsupported hosts
 exit with status 77 rather than manufacturing platform evidence. A

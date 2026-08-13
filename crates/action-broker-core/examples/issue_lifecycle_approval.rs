@@ -27,8 +27,10 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signer, SigningKey};
 use uuid::Uuid;
 
-const KEY_ID: &str = "lifecycle-test-key";
-const TEST_SIGNING_SEED: [u8; 32] = [7_u8; 32];
+const PRIMARY_KEY_ID: &str = "lifecycle-test-key";
+const REPLACEMENT_KEY_ID: &str = "lifecycle-replacement-key";
+const PRIMARY_SIGNING_SEED: [u8; 32] = [7_u8; 32];
+const REPLACEMENT_SIGNING_SEED: [u8; 32] = [11_u8; 32];
 const APPROVAL_LIFETIME_SECONDS: i64 = 60;
 const EXPIRED_APPROVAL_AGE_SECONDS: i64 = 120;
 const FUTURE_APPROVAL_OFFSET_SECONDS: i64 = 120;
@@ -36,6 +38,7 @@ const FUTURE_APPROVAL_OFFSET_SECONDS: i64 = 120;
 #[derive(Clone, Copy)]
 enum RequestProfile {
     CurrentElevated,
+    ReplacementElevated,
     CurrentExplicit,
     ExpiredElevated,
     FutureElevated,
@@ -55,22 +58,56 @@ fn run() -> Result<(), Box<dyn Error>> {
     match mode.as_str() {
         "public-key" => {
             reject_extra(&mut arguments)?;
-            println!("{}", hex::encode(signing_key().verifying_key().as_bytes()));
+            println!(
+                "{}",
+                hex::encode(primary_signing_key().verifying_key().as_bytes())
+            );
+        }
+        "replacement-public-key" => {
+            reject_extra(&mut arguments)?;
+            println!(
+                "{}",
+                hex::encode(replacement_signing_key().verifying_key().as_bytes())
+            );
         }
         "request" => issue_request(&mut arguments, RequestProfile::CurrentElevated)?,
+        "replacement-request" => {
+            issue_request(&mut arguments, RequestProfile::ReplacementElevated)?;
+        }
         "insufficient-approval-request" => {
             issue_request(&mut arguments, RequestProfile::CurrentExplicit)?;
         }
         "expired-request" => issue_request(&mut arguments, RequestProfile::ExpiredElevated)?,
         "future-request" => issue_request(&mut arguments, RequestProfile::FutureElevated)?,
+        "issued-at" => print_request_issued_at(&mut arguments)?,
         "verify" => verify_request_file(&mut arguments)?,
         _ => {
             return Err(invalid(
-                "mode must be public-key, request, insufficient-approval-request, expired-request, future-request, or verify",
+                "mode must be public-key, replacement-public-key, request, replacement-request, insufficient-approval-request, expired-request, future-request, issued-at, or verify",
             )
             .into());
         }
     }
+    Ok(())
+}
+
+fn print_request_issued_at(
+    arguments: &mut impl Iterator<Item = String>,
+) -> Result<(), Box<dyn Error>> {
+    let path = required(arguments, "request_path")?;
+    reject_extra(arguments)?;
+    let bytes = std::fs::read(path)?;
+    let request: ActionRequest = serde_json::from_slice(&bytes)?;
+    verify_fixture_request(&request)?;
+    let token = SignedApprovalTokenV1::parse_compact(
+        request
+            .approval_token
+            .as_deref()
+            .ok_or_else(|| invalid("request does not contain an approval token"))?,
+    )?;
+    let payload = URL_SAFE_NO_PAD.decode(token.payload)?;
+    let claims: ApprovalClaimsV1 = serde_json::from_slice(&payload)?;
+    println!("{}", claims.issued_at_unix_seconds);
     Ok(())
 }
 
@@ -117,15 +154,25 @@ fn issue_request(
     };
     let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())?;
     let issued_at = match profile {
-        RequestProfile::CurrentElevated | RequestProfile::CurrentExplicit => now,
+        RequestProfile::CurrentElevated
+        | RequestProfile::ReplacementElevated
+        | RequestProfile::CurrentExplicit => now,
         RequestProfile::ExpiredElevated => now.saturating_sub(EXPIRED_APPROVAL_AGE_SECONDS),
         RequestProfile::FutureElevated => now.saturating_add(FUTURE_APPROVAL_OFFSET_SECONDS),
     };
     let approval_type = match profile {
         RequestProfile::CurrentExplicit => ApprovalType::ExplicitUser,
         RequestProfile::CurrentElevated
+        | RequestProfile::ReplacementElevated
         | RequestProfile::ExpiredElevated
         | RequestProfile::FutureElevated => ApprovalType::ElevatedUser,
+    };
+    let (key_id, signing_key) = match profile {
+        RequestProfile::ReplacementElevated => (REPLACEMENT_KEY_ID, replacement_signing_key()),
+        RequestProfile::CurrentElevated
+        | RequestProfile::CurrentExplicit
+        | RequestProfile::ExpiredElevated
+        | RequestProfile::FutureElevated => (PRIMARY_KEY_ID, primary_signing_key()),
     };
     let claims = ApprovalClaimsV1 {
         version: APPROVAL_TOKEN_VERSION,
@@ -143,17 +190,19 @@ fn issue_request(
         nonce,
     };
     let payload = serde_jcs::to_vec(&claims)?;
-    let signature = signing_key().sign(&payload);
+    let signature = signing_key.sign(&payload);
     request.approval_token = Some(
         SignedApprovalTokenV1 {
-            key_id: KEY_ID.to_owned(),
+            key_id: key_id.to_owned(),
             payload: URL_SAFE_NO_PAD.encode(payload),
             signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
         }
         .to_compact()?,
     );
     match profile {
-        RequestProfile::CurrentElevated => verify_fixture_request(&request)?,
+        RequestProfile::CurrentElevated | RequestProfile::ReplacementElevated => {
+            verify_fixture_request(&request)?;
+        }
         RequestProfile::CurrentExplicit => {
             verify_invalid_fixture_request(&request, ApprovalError::ApprovalTypeMismatch)?;
         }
@@ -213,8 +262,17 @@ fn verify_invalid_fixture_request(
 fn fixture_verifier() -> Result<ApprovalVerifier, ApprovalError> {
     let mut keys = TrustedKeyRegistry::new();
     keys.insert(
-        KEY_ID,
-        signing_key().verifying_key(),
+        PRIMARY_KEY_ID,
+        primary_signing_key().verifying_key(),
+        TrustedKeyLifecycle {
+            active_from_unix_seconds: 0,
+            retire_at_unix_seconds: None,
+            revoke_at_unix_seconds: None,
+        },
+    )?;
+    keys.insert(
+        REPLACEMENT_KEY_ID,
+        replacement_signing_key().verifying_key(),
         TrustedKeyLifecycle {
             active_from_unix_seconds: 0,
             retire_at_unix_seconds: None,
@@ -228,8 +286,12 @@ fn fixture_verifier() -> Result<ApprovalVerifier, ApprovalError> {
     )
 }
 
-fn signing_key() -> SigningKey {
-    SigningKey::from_bytes(&TEST_SIGNING_SEED)
+fn primary_signing_key() -> SigningKey {
+    SigningKey::from_bytes(&PRIMARY_SIGNING_SEED)
+}
+
+fn replacement_signing_key() -> SigningKey {
+    SigningKey::from_bytes(&REPLACEMENT_SIGNING_SEED)
 }
 
 fn required(
