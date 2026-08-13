@@ -129,10 +129,13 @@ lifetime and bounded allowed clock skew; a token cannot request a longer window.
 The expiration check occurs before nonce consumption and again immediately
 before dispatch if validation or queuing could cross the deadline.
 
-Expired tokens generate an `expired_approval` event. A wall-clock jump is
-security-relevant: the daemon should use a monitored trusted time source and a
-monotonic clock for elapsed execution deadlines. When wall-clock correctness is
-uncertain beyond configured skew, approval-required operations fail closed.
+Expired and not-yet-valid tokens both return the external `approval_expired`
+classification and generate an `expired_approval` event. This avoids exposing a
+separate timing oracle while still denying outside the signed validity window.
+A wall-clock jump is security-relevant: the daemon should use a monitored
+trusted time source and a monotonic clock for elapsed execution deadlines. When
+wall-clock correctness is uncertain beyond configured skew, approval-required
+operations fail closed.
 
 ## Approval types
 

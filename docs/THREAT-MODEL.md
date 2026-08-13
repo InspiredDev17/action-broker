@@ -59,13 +59,14 @@ cleanup, audit validation, and restart. Its root phase only creates disposable
 numeric identities and root-owned fixture policy; requests still traverse the
 normal daemon boundary. A test-only Rust issuer exercises real Ed25519/JCS
 approval verification for an approved `sleep`. The harness first submits a
-correctly signed expired token and proves `expired_approval` is emitted without
-an audit start. A current token reuses the same nonce; its signed argument is
-then tampered, producing `approval_tampering` without an audit start. The exact
-current request remains usable, proving neither failure consumed the nonce. The
-harness proves first-signal cancellation and descendant termination, then
-reopens the durable ledger and proves the consumed token is rejected before a
-second audit start or process launch, with mandatory `replayed_approval`
+correctly signed not-yet-valid token and an expired token. Both produce the
+same external `approval_expired`/`expired_approval` classification without an
+audit start. A current token reuses the same nonce; its signed argument is then
+tampered, producing `approval_tampering` without an audit start. The exact
+current request remains usable, proving none of those failures consumed the
+nonce. The harness proves first-signal cancellation and descendant termination,
+then reopens the durable ledger and proves the consumed token is rejected before
+a second audit start or process launch, with mandatory `replayed_approval`
 evidence. The embedded fixture key is not production authority. This still does
 not qualify general approved-command isolation, cgroup containment, production
 filesystem mounts, or external side-effect recovery.

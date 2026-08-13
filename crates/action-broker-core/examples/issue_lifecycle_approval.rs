@@ -31,6 +31,14 @@ const KEY_ID: &str = "lifecycle-test-key";
 const TEST_SIGNING_SEED: [u8; 32] = [7_u8; 32];
 const APPROVAL_LIFETIME_SECONDS: i64 = 60;
 const EXPIRED_APPROVAL_AGE_SECONDS: i64 = 120;
+const FUTURE_APPROVAL_OFFSET_SECONDS: i64 = 120;
+
+#[derive(Clone, Copy)]
+enum RequestTimeProfile {
+    Current,
+    Expired,
+    Future,
+}
 
 fn main() {
     if let Err(error) = run() {
@@ -48,13 +56,15 @@ fn run() -> Result<(), Box<dyn Error>> {
             reject_extra(&mut arguments)?;
             println!("{}", hex::encode(signing_key().verifying_key().as_bytes()));
         }
-        "request" => issue_request(&mut arguments, false)?,
-        "expired-request" => issue_request(&mut arguments, true)?,
+        "request" => issue_request(&mut arguments, RequestTimeProfile::Current)?,
+        "expired-request" => issue_request(&mut arguments, RequestTimeProfile::Expired)?,
+        "future-request" => issue_request(&mut arguments, RequestTimeProfile::Future)?,
         "verify" => verify_request_file(&mut arguments)?,
         _ => {
-            return Err(
-                invalid("mode must be public-key, request, expired-request, or verify").into(),
-            );
+            return Err(invalid(
+                "mode must be public-key, request, expired-request, future-request, or verify",
+            )
+            .into());
         }
     }
     Ok(())
@@ -70,7 +80,7 @@ fn verify_request_file(arguments: &mut impl Iterator<Item = String>) -> Result<(
 
 fn issue_request(
     arguments: &mut impl Iterator<Item = String>,
-    expired: bool,
+    time_profile: RequestTimeProfile,
 ) -> Result<(), Box<dyn Error>> {
     let request_id = Uuid::parse_str(&required(arguments, "request_id")?)?;
     let program_id = required(arguments, "program_id")?;
@@ -102,10 +112,10 @@ fn issue_request(
         approval_token: None,
     };
     let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())?;
-    let issued_at = if expired {
-        now.saturating_sub(EXPIRED_APPROVAL_AGE_SECONDS)
-    } else {
-        now
+    let issued_at = match time_profile {
+        RequestTimeProfile::Current => now,
+        RequestTimeProfile::Expired => now.saturating_sub(EXPIRED_APPROVAL_AGE_SECONDS),
+        RequestTimeProfile::Future => now.saturating_add(FUTURE_APPROVAL_OFFSET_SECONDS),
     };
     let claims = ApprovalClaimsV1 {
         version: APPROVAL_TOKEN_VERSION,
@@ -132,10 +142,14 @@ fn issue_request(
         }
         .to_compact()?,
     );
-    if expired {
-        verify_expired_fixture_request(&request)?;
-    } else {
-        verify_fixture_request(&request)?;
+    match time_profile {
+        RequestTimeProfile::Current => verify_fixture_request(&request)?,
+        RequestTimeProfile::Expired => {
+            verify_time_invalid_fixture_request(&request, ApprovalError::Expired)?;
+        }
+        RequestTimeProfile::Future => {
+            verify_time_invalid_fixture_request(&request, ApprovalError::NotYetValid)?;
+        }
     }
     serde_json::to_writer(io::stdout().lock(), &request)?;
     io::stdout().lock().write_all(b"\n")?;
@@ -148,13 +162,19 @@ fn verify_fixture_request(request: &ActionRequest) -> Result<(), Box<dyn Error>>
     Ok(())
 }
 
-fn verify_expired_fixture_request(request: &ActionRequest) -> Result<(), Box<dyn Error>> {
+fn verify_time_invalid_fixture_request(
+    request: &ActionRequest,
+    expected: ApprovalError,
+) -> Result<(), Box<dyn Error>> {
     let verifier = fixture_verifier()?;
-    if !matches!(
-        verifier.verify_embedded(request, &[ApprovalType::ElevatedUser]),
-        Err(ApprovalError::Expired)
-    ) {
-        return Err(invalid("expired fixture request was not rejected as expired").into());
+    let result = verifier.verify_embedded(request, &[ApprovalType::ElevatedUser]);
+    let matches_expected = matches!(
+        (&result, expected),
+        (Err(ApprovalError::Expired), ApprovalError::Expired)
+            | (Err(ApprovalError::NotYetValid), ApprovalError::NotYetValid)
+    );
+    if !matches_expected {
+        return Err(invalid("time-invalid fixture request had an unexpected result").into());
     }
     Ok(())
 }
