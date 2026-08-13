@@ -142,13 +142,15 @@ The production runtime has no TypeScript and no Python dependency.
 Audit segments can be verified without serving requests or modifying state:
 
 ```text
-action-brokerd verify-audit --path /var/lib/action-broker/audit.jsonl
+action-brokerd verify-audit --require-complete \
+  --path /var/lib/action-broker/audit.jsonl
 ```
 
 For rotated segments, pass the prior segment head with
 `--initial-previous-head`; pass an independently protected checkpoint with
-`--expected-head`. Verification emits only record count, chain heads, and time
-bounds.
+`--expected-head`. Verification emits only record and unfinished-action counts,
+chain heads, and time bounds. `--require-complete` rejects a valid chain if any
+start lacks a matching finish.
 
 ## Development
 

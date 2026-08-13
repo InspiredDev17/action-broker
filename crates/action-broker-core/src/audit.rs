@@ -93,6 +93,7 @@ pub trait AuditSink: Send + Sync {
 #[serde(deny_unknown_fields)]
 pub struct AuditVerificationSummary {
     pub record_count: u64,
+    pub unfinished_action_count: u64,
     pub initial_previous_sha256: String,
     pub head_sha256: String,
     pub first_event_at_unix_ms: Option<i128>,
@@ -354,6 +355,7 @@ fn validate_existing_chain(
     Ok(ValidatedAuditChain {
         summary: AuditVerificationSummary {
             record_count,
+            unfinished_action_count: pending.len() as u64,
             initial_previous_sha256: initial_previous_hash.to_owned(),
             head_sha256: previous,
             first_event_at_unix_ms,
@@ -831,6 +833,21 @@ mod tests {
 
         let summary = verify_audit_chain(&path, None, None)?;
         assert_eq!(summary.record_count, 2);
+        assert_eq!(summary.unfinished_action_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn verification_summary_reports_unfinished_actions() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("audit.jsonl");
+        let sink = HashChainedJsonlAuditSink::open(&path)?;
+        sink.record(&event())?;
+        drop(sink);
+
+        let summary = verify_audit_chain(&path, None, None)?;
+        assert_eq!(summary.record_count, 1);
+        assert_eq!(summary.unfinished_action_count, 1);
         Ok(())
     }
 
@@ -913,6 +930,7 @@ mod tests {
 
         let summary = verify_audit_chain(&path, None, None)?;
         assert_eq!(summary.record_count, 2);
+        assert_eq!(summary.unfinished_action_count, 0);
         assert_eq!(summary.initial_previous_sha256, GENESIS_HASH);
         assert_eq!(summary.first_event_at_unix_ms, Some(1));
         assert_eq!(summary.last_event_at_unix_ms, Some(2));

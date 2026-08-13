@@ -427,6 +427,7 @@ Verify the first segment and print its bounded, secret-free summary:
 ```text
 action-brokerd verify-audit \
   --path /var/lib/action-broker/audit-0001.jsonl \
+  --require-complete \
   --expected-head <independently-protected-final-head>
 ```
 
@@ -435,6 +436,7 @@ Verify a rotated segment by binding both ends:
 ```text
 action-brokerd verify-audit \
   --path /var/lib/action-broker/audit-0002.jsonl \
+  --require-complete \
   --initial-previous-head <audit-0001-final-head> \
   --expected-head <audit-0002-protected-final-head>
 ```
@@ -450,6 +452,12 @@ discontinuity, and external-checkpoint mismatch. These semantic checks run
 before new records are appended and again on startup and offline verification.
 Rotate well before a bound is reached; increasing a limit is an administrative
 review, not an incident workaround.
+
+The JSON summary includes `unfinished_action_count`. Use `--require-complete`
+for planned rotation, backup, and archival gates; it exits nonzero instead of
+printing a success summary when that count is nonzero. Without the flag, the
+verifier still validates and reports crash-left unfinished starts so incident
+collection can preserve truthful partial history.
 
 Rotation must occur only after admission stops and active actions drain. An
 unfinished start may remain as truthful crash evidence, but a finish is never

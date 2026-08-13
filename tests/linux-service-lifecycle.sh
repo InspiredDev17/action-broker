@@ -763,8 +763,8 @@ jq -e -s --arg request_id "$retirement_request_id" '
     .agent_id == "lifecycle-agent" and .task_id == "lifecycle-command-cancellation" and
     .capability == "ExecuteApprovedCommand" and (.target_digest | length == 64))
 ' "$event_path" >/dev/null
-audit_summary=$("$bin_dir/action-brokerd" verify-audit --path "$audit_path")
-jq -e '.record_count == 10 and (.head_sha256 | length == 64)' <<<"$audit_summary" >/dev/null
+audit_summary=$("$bin_dir/action-brokerd" verify-audit --require-complete --path "$audit_path")
+jq -e '.record_count == 10 and .unfinished_action_count == 0 and (.head_sha256 | length == 64)' <<<"$audit_summary" >/dev/null
 
 # Hold one authenticated worker in the real framed-read path, then request a
 # first-signal shutdown. The configured read deadline is shorter than the drain
@@ -781,8 +781,8 @@ hold_pid=''
 
 jq -e -s 'any(.[]; .kind == "permission_bypass_attempt" and .reason_code == "unauthorized_platform_peer")' "$event_path" >/dev/null
 jq -e -s 'any(.[]; .kind == "resource_abuse_pattern" and .reason_code == "request_frame_incomplete")' "$event_path" >/dev/null
-audit_summary=$("$bin_dir/action-brokerd" verify-audit --path "$audit_path")
-jq -e '.record_count == 10 and (.head_sha256 | length == 64)' <<<"$audit_summary" >/dev/null
+audit_summary=$("$bin_dir/action-brokerd" verify-audit --require-complete --path "$audit_path")
+jq -e '.record_count == 10 and .unfinished_action_count == 0 and (.head_sha256 | length == 64)' <<<"$audit_summary" >/dev/null
 
 # Reopen the same replay ledger, audit chain, and Agent Green spool, then prove
 # that a second clean lifecycle can bind and remove the same socket pathname.

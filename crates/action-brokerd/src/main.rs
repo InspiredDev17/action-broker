@@ -14,7 +14,9 @@ use action_broker_core::approval::{
     ApprovalVerifier, ApprovalVerifierConfig, ReplayLedgerConfig, SqliteReplayStore,
     TrustedKeyLifecycle, TrustedKeyRegistry,
 };
-use action_broker_core::audit::{HashChainedJsonlAuditSink, verify_audit_chain};
+use action_broker_core::audit::{
+    AuditVerificationSummary, HashChainedJsonlAuditSink, verify_audit_chain,
+};
 use action_broker_core::broker::{ActionBroker, AuthenticatedRequester, BrokerLimits};
 use action_broker_core::command::{
     ApprovedCommandExecutor, CancellationToken, CommandPolicyConfig,
@@ -433,6 +435,9 @@ enum Command {
         /// Optional independently protected lowercase SHA-256 chain head.
         #[arg(long)]
         expected_head: Option<String>,
+        /// Reject a valid segment when any start lacks a matching finish.
+        #[arg(long)]
+        require_complete: bool,
     },
 }
 
@@ -533,10 +538,12 @@ fn run() -> Result<(), BrokerError> {
             path,
             initial_previous_head,
             expected_head,
+            require_complete,
         } => print_audit_verification(
             &path,
             initial_previous_head.as_deref(),
             expected_head.as_deref(),
+            require_complete,
         ),
     }
 }
@@ -545,11 +552,26 @@ fn print_audit_verification(
     path: &Path,
     initial_previous_head: Option<&str>,
     expected_head: Option<&str>,
+    require_complete: bool,
 ) -> Result<(), BrokerError> {
     let summary = verify_audit_chain(path, initial_previous_head, expected_head)?;
+    require_complete_audit(&summary, require_complete)?;
     serde_json::to_writer_pretty(std::io::stdout().lock(), &summary)
         .map_err(|_| BrokerError::new(ErrorCode::Internal, "audit summary serialization failed"))?;
     println!();
+    Ok(())
+}
+
+fn require_complete_audit(
+    summary: &AuditVerificationSummary,
+    require_complete: bool,
+) -> Result<(), BrokerError> {
+    if require_complete && summary.unfinished_action_count != 0 {
+        return Err(BrokerError::new(
+            ErrorCode::AuditFailure,
+            "audit segment contains unfinished actions",
+        ));
+    }
     Ok(())
 }
 
@@ -1414,20 +1436,53 @@ mod tests {
             &prior,
             "--expected-head",
             &final_head,
+            "--require-complete",
         ])?;
         match cli.command {
             Command::VerifyAudit {
                 path,
                 initial_previous_head,
                 expected_head,
+                require_complete,
             } => {
                 assert_eq!(path, Path::new("/var/lib/action-broker/audit.jsonl"));
                 assert_eq!(initial_previous_head.as_deref(), Some(prior.as_str()));
                 assert_eq!(expected_head.as_deref(), Some(final_head.as_str()));
+                assert!(require_complete);
             }
             _ => return Err("unexpected command".into()),
         }
         Ok(())
+    }
+
+    #[test]
+    fn complete_audit_gate_rejects_unfinished_actions() {
+        let summary = AuditVerificationSummary {
+            record_count: 1,
+            unfinished_action_count: 1,
+            initial_previous_sha256: "0".repeat(64),
+            head_sha256: "1".repeat(64),
+            first_event_at_unix_ms: Some(1),
+            last_event_at_unix_ms: Some(1),
+        };
+        assert!(require_complete_audit(&summary, false).is_ok());
+        assert!(matches!(
+            require_complete_audit(&summary, true),
+            Err(BrokerError {
+                code: ErrorCode::AuditFailure,
+                ..
+            })
+        ));
+        assert!(
+            require_complete_audit(
+                &AuditVerificationSummary {
+                    unfinished_action_count: 0,
+                    ..summary
+                },
+                true
+            )
+            .is_ok()
+        );
     }
 
     #[test]
