@@ -1032,9 +1032,9 @@ fn remove_socket_if_owned(path: &Path, device: u64, inode: u64) -> Result<bool, 
 fn peer_uid(stream: &UnixStream) -> Option<u32> {
     #[cfg(target_os = "linux")]
     {
-        return rustix::net::sockopt::socket_peercred(stream)
+        rustix::net::sockopt::socket_peercred(stream)
             .ok()
-            .map(|credentials| credentials.uid.as_raw());
+            .map(|credentials| credentials.uid.as_raw())
     }
     #[cfg(not(target_os = "linux"))]
     {
