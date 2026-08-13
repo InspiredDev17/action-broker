@@ -442,10 +442,13 @@ action-brokerd verify-audit \
 The verifier is read-only and does not require `serve`. It accepts only regular,
 private audit files opened without following the final symlink, limits a segment
 to 1 GiB, each record to 256 KiB, and the record count to 4,000,000. It rejects
-unknown JSON fields, missing final newlines, concurrent size changes, invalid
-hash syntax, chain discontinuity, and external-checkpoint mismatch. Rotate well
-before a bound is reached; increasing a limit is an administrative review, not
-an incident workaround.
+unknown JSON fields, unsupported event versions, impossible phase/result or
+approval combinations, invalid digest syntax, finish times before their start,
+missing final newlines, concurrent size changes, chain discontinuity, and
+external-checkpoint mismatch. These semantic checks run before new records are
+appended and again on startup and offline verification. Rotate well before a
+bound is reached; increasing a limit is an administrative review, not an
+incident workaround.
 
 Rotation must set `audit_initial_previous_hash` to carry the final hash of the
 previous segment into the next and

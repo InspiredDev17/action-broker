@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::error::{BrokerError, BrokerResult, ErrorCode};
 
 const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+const AUDIT_EVENT_VERSION: u8 = 1;
 const MAX_AUDIT_LINE_BYTES: usize = 256 * 1024;
 const MAX_AUDIT_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_AUDIT_RECORDS: u64 = 4_000_000;
@@ -179,6 +180,7 @@ pub fn verify_audit_chain(
 
 impl AuditSink for HashChainedJsonlAuditSink {
     fn record(&self, event: &AuditEvent) -> BrokerResult<()> {
+        validate_event(event)?;
         let mut state = self
             .state
             .lock()
@@ -291,6 +293,7 @@ fn validate_existing_chain(
         line.pop();
         let record: ChainedAuditEvent = serde_json::from_slice(&line)
             .map_err(|_| audit_error("audit chain contains invalid JSON"))?;
+        validate_event(&record.event)?;
         if record.previous_hash != previous
             || compute_record_hash(&previous, &record.event)? != record.record_hash
         {
@@ -328,6 +331,128 @@ fn validate_existing_chain(
         first_event_at_unix_ms,
         last_event_at_unix_ms,
     })
+}
+
+fn validate_event(event: &AuditEvent) -> BrokerResult<()> {
+    if event.version != AUDIT_EVENT_VERSION {
+        return Err(audit_error("audit event version is unsupported"));
+    }
+    validate_hash(
+        &event.validated_arguments_hash,
+        "audit arguments digest is invalid",
+    )?;
+    validate_approval(&event.approval)?;
+    if event.started_at_unix_ms < 0 {
+        return Err(audit_error("audit start time is invalid"));
+    }
+
+    match event.phase {
+        AuditPhase::Started => {
+            if event.finished_at_unix_ms.is_some()
+                || event.exit_status.is_some()
+                || event.output_digest.is_some()
+                || event.error_code.is_some()
+                || !event.files_changed.is_empty()
+                || !event.network_destinations.is_empty()
+            {
+                return Err(audit_error("audit start record contains result state"));
+            }
+        }
+        AuditPhase::Finished => {
+            let finished_at = event
+                .finished_at_unix_ms
+                .ok_or_else(|| audit_error("audit finish time is missing"))?;
+            if finished_at < event.started_at_unix_ms {
+                return Err(audit_error("audit finish time precedes its start"));
+            }
+            if event.error_code.is_some() {
+                if event.output_digest.is_some()
+                    || event.exit_status.is_some()
+                    || !event.files_changed.is_empty()
+                {
+                    return Err(audit_error(
+                        "failed audit record contains successful result state",
+                    ));
+                }
+            } else if event.output_digest.is_none() {
+                return Err(audit_error(
+                    "successful audit record lacks an output digest",
+                ));
+            }
+        }
+    }
+
+    validate_optional_hash(
+        event.output_digest.as_deref(),
+        "audit output digest is invalid",
+    )?;
+    for change in &event.files_changed {
+        if change.root_id.is_empty()
+            || !matches!(
+                change.operation.as_str(),
+                "write" | "create" | "move_source" | "move_destination" | "recoverable_delete"
+            )
+            || change.before_digest.is_none() && change.after_digest.is_none()
+        {
+            return Err(audit_error("audit file-change metadata is invalid"));
+        }
+        validate_hash(&change.relative_path_digest, "audit path digest is invalid")?;
+        validate_optional_hash(
+            change.before_digest.as_deref(),
+            "audit pre-change digest is invalid",
+        )?;
+        validate_optional_hash(
+            change.after_digest.as_deref(),
+            "audit post-change digest is invalid",
+        )?;
+    }
+    if event.network_destinations.iter().any(String::is_empty) {
+        return Err(audit_error("audit network destination is invalid"));
+    }
+    Ok(())
+}
+
+fn validate_approval(approval: &ApprovalAudit) -> BrokerResult<()> {
+    if !approval.required {
+        if approval.approval_type.is_some()
+            || approval.token_digest.is_some()
+            || approval.key_id.is_some()
+            || approval.nonce_digest_sha256.is_some()
+            || approval.expires_at_unix_seconds.is_some()
+        {
+            return Err(audit_error(
+                "policy-only audit record contains approval metadata",
+            ));
+        }
+        return Ok(());
+    }
+
+    if approval.approval_type.as_deref().is_none_or(str::is_empty)
+        || approval.key_id.as_deref().is_none_or(str::is_empty)
+        || approval.token_digest.is_none()
+        || approval.nonce_digest_sha256.is_some() != approval.expires_at_unix_seconds.is_some()
+        || approval
+            .expires_at_unix_seconds
+            .is_some_and(|value| value <= 0)
+    {
+        return Err(audit_error("approval audit metadata is inconsistent"));
+    }
+    validate_optional_hash(
+        approval.token_digest.as_deref(),
+        "audit approval token digest is invalid",
+    )?;
+    validate_optional_hash(
+        approval.nonce_digest_sha256.as_deref(),
+        "audit approval nonce digest is invalid",
+    )?;
+    Ok(())
+}
+
+fn validate_optional_hash(value: Option<&str>, message: &'static str) -> BrokerResult<()> {
+    if let Some(value) = value {
+        validate_hash(value, message)?;
+    }
+    Ok(())
 }
 
 fn open_audit_file(path: &Path, append: bool) -> BrokerResult<File> {
@@ -457,6 +582,29 @@ mod tests {
         }
     }
 
+    fn approved_event() -> AuditEvent {
+        AuditEvent {
+            approval: ApprovalAudit {
+                required: true,
+                approval_type: Some("ElevatedUser".to_owned()),
+                token_digest: Some("11".repeat(32)),
+                key_id: Some("approval-key".to_owned()),
+                nonce_digest_sha256: Some("22".repeat(32)),
+                expires_at_unix_seconds: Some(60),
+            },
+            ..event()
+        }
+    }
+
+    fn finished_event() -> AuditEvent {
+        AuditEvent {
+            phase: AuditPhase::Finished,
+            finished_at_unix_ms: Some(2),
+            output_digest: Some("33".repeat(32)),
+            ..event()
+        }
+    }
+
     #[test]
     fn legacy_approval_shape_remains_canonical() -> Result<(), Box<dyn std::error::Error>> {
         let approval = event().approval;
@@ -476,11 +624,107 @@ mod tests {
                 .any(|value| value == b"expires_at")
         );
 
-        let legacy_approved = br#"{"approval_type":"ElevatedUser","key_id":"legacy-key","required":true,"token_digest":"legacy-token-digest"}"#;
-        let parsed: ApprovalAudit = serde_json::from_slice(legacy_approved)?;
+        let legacy_token_digest = "44".repeat(32);
+        let legacy_approved = format!(
+            r#"{{"approval_type":"ElevatedUser","key_id":"legacy-key","required":true,"token_digest":"{legacy_token_digest}"}}"#
+        );
+        let parsed: ApprovalAudit = serde_json::from_slice(legacy_approved.as_bytes())?;
         assert_eq!(parsed.nonce_digest_sha256, None);
         assert_eq!(parsed.expires_at_unix_seconds, None);
-        assert_eq!(serde_jcs::to_vec(&parsed)?, legacy_approved);
+        assert_eq!(serde_jcs::to_vec(&parsed)?, legacy_approved.as_bytes());
+        validate_event(&AuditEvent {
+            approval: parsed,
+            ..event()
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn writer_rejects_unsupported_or_inconsistent_events_without_append()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("audit.jsonl");
+        let sink = HashChainedJsonlAuditSink::open(&path)?;
+        let invalid = [
+            AuditEvent {
+                version: 2,
+                ..event()
+            },
+            AuditEvent {
+                finished_at_unix_ms: Some(2),
+                ..event()
+            },
+            AuditEvent {
+                phase: AuditPhase::Finished,
+                finished_at_unix_ms: Some(0),
+                output_digest: Some("33".repeat(32)),
+                ..event()
+            },
+            AuditEvent {
+                phase: AuditPhase::Finished,
+                finished_at_unix_ms: Some(2),
+                ..event()
+            },
+            AuditEvent {
+                phase: AuditPhase::Finished,
+                finished_at_unix_ms: Some(2),
+                error_code: Some(ErrorCode::ExecutionFailure),
+                output_digest: Some("33".repeat(32)),
+                ..event()
+            },
+            AuditEvent {
+                approval: ApprovalAudit {
+                    required: false,
+                    key_id: Some("unexpected-key".to_owned()),
+                    ..event().approval
+                },
+                ..event()
+            },
+            AuditEvent {
+                validated_arguments_hash: "not-a-sha256".to_owned(),
+                ..event()
+            },
+            AuditEvent {
+                approval: ApprovalAudit {
+                    expires_at_unix_seconds: None,
+                    ..approved_event().approval
+                },
+                ..event()
+            },
+            AuditEvent {
+                approval: ApprovalAudit {
+                    token_digest: Some("not-a-sha256".to_owned()),
+                    ..approved_event().approval
+                },
+                ..event()
+            },
+        ];
+        for invalid_event in invalid {
+            assert!(sink.record(&invalid_event).is_err());
+        }
+        assert_eq!(fs::metadata(path)?.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn verifier_rejects_semantically_invalid_but_correctly_hashed_record()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("audit.jsonl");
+        let invalid = AuditEvent {
+            version: 2,
+            ..event()
+        };
+        let record = ChainedAuditEvent {
+            previous_hash: GENESIS_HASH.to_owned(),
+            record_hash: compute_record_hash(GENESIS_HASH, &invalid)?,
+            event: invalid,
+        };
+        let mut encoded = serde_json::to_vec(&record)?;
+        encoded.push(b'\n');
+        fs::write(&path, encoded)?;
+        assert!(verify_audit_chain(&path, None, None).is_err());
+        assert!(HashChainedJsonlAuditSink::open(&path).is_err());
         Ok(())
     }
 
@@ -503,11 +747,7 @@ mod tests {
         let path = directory.path().join("audit.jsonl");
         let sink = HashChainedJsonlAuditSink::open(&path)?;
         sink.record(&event())?;
-        sink.record(&AuditEvent {
-            phase: AuditPhase::Finished,
-            finished_at_unix_ms: Some(2),
-            ..event()
-        })?;
+        sink.record(&finished_event())?;
         drop(sink);
 
         let summary = verify_audit_chain(&path, None, None)?;

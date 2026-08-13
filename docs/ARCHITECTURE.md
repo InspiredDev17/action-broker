@@ -202,8 +202,11 @@ file changes, and contacted network destinations. Audit records form a hash
 chain so deletion or reordering is detectable when the chain head is anchored
 outside the file.
 
-Audit parsing is strict and bounded. Startup and the read-only `verify-audit`
-operator command reject unknown fields, oversized or incomplete records,
+Audit parsing is strict and bounded. The writer, startup, and the read-only
+`verify-audit` operator command share semantic validation that rejects
+unsupported event versions, impossible phase/result combinations,
+inconsistent approval metadata, invalid digests, and finish times before their
+start. They also reject unknown fields, oversized or incomplete records,
 symlinks, same-path object replacement, broken hashes, and files that change
 during validation. A rotated segment is configured with the exact final head
 of its predecessor; genesis is valid only for the first segment.
