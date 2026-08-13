@@ -16,11 +16,12 @@ skip() {
 }
 
 usage() {
-  printf 'usage: %s --daemon /absolute/action-brokerd --client /absolute/lifecycletestclient\n' "$0" >&2
+  printf 'usage: %s --daemon /absolute/action-brokerd --client /absolute/lifecycletestclient --issuer /absolute/issue_lifecycle_approval\n' "$0" >&2
 }
 
 daemon_source=''
 client_source=''
+issuer_source=''
 while (($# > 0)); do
   case "$1" in
     --daemon)
@@ -31,6 +32,11 @@ while (($# > 0)); do
     --client)
       (($# >= 2)) || { usage; exit 2; }
       client_source=$2
+      shift 2
+      ;;
+    --issuer)
+      (($# >= 2)) || { usage; exit 2; }
+      issuer_source=$2
       shift 2
       ;;
     *)
@@ -44,8 +50,9 @@ done
 ((EUID == 0)) || skip 'requires root only to establish isolated numeric test identities'
 [[ $daemon_source == /* && -f $daemon_source && ! -L $daemon_source ]] || fail 'daemon must be an absolute regular non-symlink file'
 [[ $client_source == /* && -f $client_source && ! -L $client_source ]] || fail 'client must be an absolute regular non-symlink file'
+[[ $issuer_source == /* && -f $issuer_source && ! -L $issuer_source ]] || fail 'approval issuer must be an absolute regular non-symlink file'
 
-for required_command in bwrap env getent install jq prlimit setpriv sha256sum stat; do
+for required_command in bwrap env getent install jq pgrep prlimit setpriv sha256sum stat; do
   command -v "$required_command" >/dev/null 2>&1 || skip "missing required command: $required_command"
 done
 
@@ -59,7 +66,12 @@ chmod 0755 "$test_root"
 
 daemon_pid=''
 hold_pid=''
+command_client_pid=''
 cleanup() {
+  if [[ -n $command_client_pid ]] && kill -0 "$command_client_pid" 2>/dev/null; then
+    kill -TERM "$command_client_pid" 2>/dev/null || true
+    wait "$command_client_pid" 2>/dev/null || true
+  fi
   if [[ -n $hold_pid ]] && kill -0 "$hold_pid" 2>/dev/null; then
     kill -TERM "$hold_pid" 2>/dev/null || true
     wait "$hold_pid" 2>/dev/null || true
@@ -68,7 +80,11 @@ cleanup() {
     kill -TERM "$daemon_pid" 2>/dev/null || true
     wait "$daemon_pid" 2>/dev/null || true
   fi
-  find "$test_root" -depth -delete 2>/dev/null || true
+  if [[ ${ACTION_BROKER_LIFECYCLE_PRESERVE_ON_FAILURE:-0} != 1 ]]; then
+    find "$test_root" -depth -delete 2>/dev/null || true
+  else
+    printf 'linux-service-lifecycle: preserving failed fixture at %s\n' "$test_root" >&2
+  fi
 }
 trap cleanup EXIT HUP INT TERM
 
@@ -102,6 +118,7 @@ control_dir="$test_root/control"
 mkdir -p "$bin_dir" "$config_dir" "$state_dir" "$socket_dir" "$action_root" "$control_dir"
 install -o 0 -g 0 -m 0755 "$daemon_source" "$bin_dir/action-brokerd"
 install -o 0 -g 0 -m 0755 "$client_source" "$bin_dir/lifecycletestclient"
+install -o 0 -g 0 -m 0755 "$issuer_source" "$bin_dir/issue-lifecycle-approval"
 chown "$broker_uid:$broker_gid" "$state_dir"
 chmod 0700 "$state_dir"
 chown "$broker_uid:$ipc_gid" "$socket_dir"
@@ -121,18 +138,22 @@ readonly audit_path="$state_dir/audit.jsonl"
 readonly event_path="$state_dir/agent-green.jsonl"
 readonly daemon_log="$test_root/daemon.log"
 readonly hold_marker="$control_dir/hold-ready"
+readonly command_request="$control_dir/command-request.json"
+readonly normalized_command_request="$test_root/normalized-command-request.json"
+readonly command_request_id='018f47d2-60d2-7af0-bc35-2a1f7f5a6d02'
 
-# RFC 8032 test-vector public key. The private key is deliberately absent.
-printf '%s\n' 'd75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a' >"$key_path"
+# This public key belongs only to the example fixture issuer. Production must
+# never trust it; the corresponding test seed is absent from daemon config.
+"$bin_dir/issue-lifecycle-approval" public-key >"$key_path"
 chmod 0644 "$key_path"
 chown 0:0 "$key_path"
 
 bwrap_path=$(realpath "$(command -v bwrap)")
 prlimit_path=$(realpath "$(command -v prlimit)")
-true_path=$(realpath "$(type -P true)")
+sleep_path=$(realpath "$(type -P sleep)")
 read -r bwrap_hash _ < <(sha256sum "$bwrap_path")
 read -r prlimit_hash _ < <(sha256sum "$prlimit_path")
-read -r true_hash _ < <(sha256sum "$true_path")
+read -r sleep_hash _ < <(sha256sum "$sleep_path")
 
 jq -n \
   --arg socket "$socket_path" \
@@ -149,8 +170,8 @@ jq -n \
   --arg bwrap_hash "$bwrap_hash" \
   --arg prlimit "$prlimit_path" \
   --arg prlimit_hash "$prlimit_hash" \
-  --arg true_path "$true_path" \
-  --arg true_hash "$true_hash" \
+  --arg sleep_path "$sleep_path" \
+  --arg sleep_hash "$sleep_hash" \
   '{
     socket_path: $socket,
     socket_group_id: $socket_gid,
@@ -167,7 +188,7 @@ jq -n \
     agent_green_event_spool_path: $events,
     agent_green_event_spool_maximum_bytes: 1048576,
     approval_keys: [{
-      key_id: "lifecycle-key",
+      key_id: "lifecycle-test-key",
       public_key_path: $key,
       active_from_unix_seconds: 0,
       retire_at_unix_seconds: null,
@@ -175,7 +196,7 @@ jq -n \
     }],
     approval_verifier: {maximum_ttl_seconds: 300, allowed_clock_skew_seconds: 5, maximum_payload_bytes: 16384},
     policy: {
-      grants: [{user_id: "lifecycle-user", agent_id: "lifecycle-agent", permissions: ["filesystem_read"]}],
+      grants: [{user_id: "lifecycle-user", agent_id: "lifecycle-agent", permissions: ["filesystem_read", "command_execute_approved"]}],
       disabled_capabilities: []
     },
     filesystem: {roots: [{root_id: "lifecycle", path: $action_root, readable: true, writable: false, deletable: false}]},
@@ -188,13 +209,13 @@ jq -n \
         resource_limiter_sha256: $prlimit_hash
       },
       programs: [{
-        program_id: "lifecycle-true",
-        executable_path: $true_path,
-        executable_sha256: $true_hash,
-        argument_patterns: [],
+        program_id: "lifecycle-sleep",
+        executable_path: $sleep_path,
+        executable_sha256: $sleep_hash,
+        argument_patterns: ["^[0-9]{1,2}$"],
         environment_patterns: {},
         working_directory_access: "read_only",
-        maximum_timeout_milliseconds: 1000
+        maximum_timeout_milliseconds: 30000
       }]
     },
     network: {
@@ -249,6 +270,30 @@ wait_for_file() {
   fail "timed out waiting for $path"
 }
 
+wait_for_command_start() {
+  local attempt
+  for ((attempt = 0; attempt < SOCKET_WAIT_ATTEMPTS; attempt += 1)); do
+    if jq -e --arg request_id "$command_request_id" \
+      'select(.event.request_id == $request_id and .event.phase == "started" and .event.capability == "ExecuteApprovedCommand")' \
+      "$audit_path" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep "$SOCKET_WAIT_INTERVAL"
+  done
+  fail 'approved command did not produce durable start audit evidence'
+}
+
+wait_for_sleep_process() {
+  local attempt
+  for ((attempt = 0; attempt < SOCKET_WAIT_ATTEMPTS; attempt += 1)); do
+    if pgrep -u "$broker_uid" -x sleep >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep "$SOCKET_WAIT_INTERVAL"
+  done
+  fail 'sandboxed approved command did not become observable'
+}
+
 start_daemon() {
   : >"$daemon_log"
   setpriv \
@@ -292,6 +337,48 @@ setpriv --reuid "$platform_uid" --regid "$ipc_gid" --clear-groups \
   --mode read --socket "$socket_path" --broker-uid "$broker_uid" \
   --root-id lifecycle --relative-path probe.txt --expected-content $'lifecycle-ok\n' --timeout 5s
 
+# Issue an exact short-lived approval using the same Rust request and JCS model
+# as the broker. The private test seed exists only in the fixture executable.
+setpriv --reuid "$platform_uid" --regid "$ipc_gid" --clear-groups \
+  env -i "$bin_dir/issue-lifecycle-approval" request \
+  "$command_request_id" lifecycle-sleep lifecycle . 30000 lifecycle-command-nonce-0001 \
+  >"$command_request"
+chown "$platform_uid:$ipc_gid" "$command_request"
+chmod 0600 "$command_request"
+"$bin_dir/issue-lifecycle-approval" verify "$command_request"
+setpriv --reuid "$platform_uid" --regid "$ipc_gid" --clear-groups \
+  env -i "$bin_dir/lifecycletestclient" \
+  --mode normalize-request --request "$command_request" \
+  >"$normalized_command_request"
+"$bin_dir/issue-lifecycle-approval" verify "$normalized_command_request"
+if pgrep -u "$broker_uid" -x sleep >/dev/null 2>&1; then
+  fail 'broker test UID already owns a sleep process'
+fi
+setpriv --reuid "$platform_uid" --regid "$ipc_gid" --clear-groups \
+  env -i "$bin_dir/lifecycletestclient" \
+  --mode execute-and-expect-cancel --socket "$socket_path" --broker-uid "$broker_uid" \
+  --request "$command_request" --timeout 10s &
+command_client_pid=$!
+wait_for_command_start
+wait_for_sleep_process
+stop_daemon_cleanly
+wait "$command_client_pid"
+command_client_pid=''
+if pgrep -u "$broker_uid" -x sleep >/dev/null 2>&1; then
+  fail 'sandboxed approved command survived broker shutdown'
+fi
+jq -e -s --arg request_id "$command_request_id" '
+  any(.[]; .event.request_id == $request_id and .event.phase == "started" and
+    .event.approval.required == true and .event.approval.approval_type == "ElevatedUser" and
+    .event.approval.key_id == "lifecycle-test-key") and
+  any(.[]; .event.request_id == $request_id and .event.phase == "finished" and
+    .event.error_code == "cancelled")
+' "$audit_path" >/dev/null
+
+# Continue transport coverage in a fresh daemon after approved-command
+# cancellation has durably completed.
+start_daemon
+
 # Hold one authenticated worker in the real framed-read path, then request a
 # first-signal shutdown. The configured read deadline is shorter than the drain
 # grace, so the connection is classified, recorded, and closed before exit.
@@ -308,7 +395,7 @@ hold_pid=''
 jq -e -s 'any(.[]; .kind == "permission_bypass_attempt" and .reason_code == "unauthorized_platform_peer")' "$event_path" >/dev/null
 jq -e -s 'any(.[]; .kind == "resource_abuse_pattern" and .reason_code == "request_frame_incomplete")' "$event_path" >/dev/null
 audit_summary=$("$bin_dir/action-brokerd" verify-audit --path "$audit_path")
-jq -e '.record_count == 2 and (.head_sha256 | length == 64)' <<<"$audit_summary" >/dev/null
+jq -e '.record_count == 4 and (.head_sha256 | length == 64)' <<<"$audit_summary" >/dev/null
 
 # Reopen the same replay ledger, audit chain, and Agent Green spool, then prove
 # that a second clean lifecycle can bind and remove the same socket pathname.

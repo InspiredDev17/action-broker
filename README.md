@@ -167,19 +167,28 @@ transport probe, then run the root-only fixture:
 
 ```text
 cargo build --locked --release -p action-brokerd
+cargo build --locked --release -p action-broker-core \
+  --features lifecycle-test-fixture --example issue_lifecycle_approval
 go -C client-go build -trimpath -o ../target/lifecycletestclient ./internal/lifecycletestclient
 sudo tests/linux-service-lifecycle.sh \
   --daemon "$PWD/target/release/action-brokerd" \
-  --client "$PWD/target/lifecycletestclient"
+  --client "$PWD/target/lifecycletestclient" \
+  --issuer "$PWD/target/release/examples/issue_lifecycle_approval"
 ```
 
 The harness establishes distinct numeric broker, Platform, unauthorized-peer,
 and IPC-group identities. It passes only after a typed policy-only read,
 mandatory unauthorized-peer evidence, an interrupted partial-frame drain,
-socket cleanup, audit-chain verification, and a clean restart against the same
-durable state. It requires Linux, root for creating disposable identities, and
-the tools it checks at startup. Unsupported hosts exit with status 77 rather
-than manufacturing platform evidence.
+signed approved-command cancellation with no surviving child, socket cleanup,
+audit-chain verification, and clean restarts against the same durable state. The
+issuer is excluded from normal builds behind the explicit
+`lifecycle-test-fixture` feature and embeds a test key that must never be trusted
+by a production broker. The harness requires Linux, root for creating
+disposable identities, and the tools it checks at startup. Unsupported hosts
+exit with status 77 rather than manufacturing platform evidence. A
+containerized run additionally needs an outer runner that permits nested
+unprivileged namespaces and private mounts; a blocked Bubblewrap launch is a
+failed qualification, not a reason to weaken the production profile.
 
 Treat successful unit tests as source-level evidence, not proof that a
 particular deployed host provides every desired sandbox primitive. Before

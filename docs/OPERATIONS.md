@@ -285,14 +285,26 @@ corresponding kernel/service-manager controls.
 Before host qualification, run `tests/linux-service-lifecycle.sh` with absolute
 paths to release builds of `action-brokerd` and the internal lifecycle client,
 as documented in the README. The harness uses root only to construct isolated
-numeric identities, then runs the daemon
-under a distinct unprivileged UID with empty supplementary groups, zero active
-capabilities, and `NoNewPrivs`. It verifies a typed read allow path, an
+numeric identities, then runs the daemon under a distinct unprivileged UID with
+empty supplementary groups, zero active capabilities, and `NoNewPrivs`. It
+verifies a typed read allow path, an
 unconfigured same-IPC-group UID deny path and Agent Green event, an in-flight
 partial-frame first-signal drain, exact socket cleanup, the audit chain, and a
-restart using the same durable files. A pass qualifies this narrow lifecycle on
-the tested Linux host only; it does not attest cgroups, seccomp, command
-execution, external effects, or the production service-manager profile.
+restart using the same durable files. It also issues a short-lived, exact-scope
+test approval through the repository's Rust/JCS model, starts a sandboxed
+approved command, sends `SIGTERM`, requires a broker-confirmed cancelled result,
+and proves no process under the broker test UID survives. The embedded fixture
+signing key must never appear in production trust configuration; its binary is
+excluded from normal builds unless `lifecycle-test-fixture` is explicitly
+enabled. A pass qualifies this narrow lifecycle on the tested Linux host only;
+it does not attest cgroups, seccomp, general command containment, external
+effects, or the production service-manager profile.
+
+Containerized qualification requires an outer runner that permits unprivileged
+user namespaces and their private mounts. If the container runtime blocks
+those primitives, Bubblewrap must fail closed and the run is not qualification
+evidence. Do not weaken the production host profile merely to make the harness
+pass.
 
 ### macOS
 

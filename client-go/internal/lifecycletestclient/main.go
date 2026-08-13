@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -26,16 +27,20 @@ func main() {
 }
 
 func run() error {
-	mode := flag.String("mode", "read", "probe mode: read or hold-incomplete-frame")
+	mode := flag.String("mode", "read", "probe mode: read, execute-and-expect-cancel, or hold-incomplete-frame")
 	socketPath := flag.String("socket", "", "absolute broker Unix-socket path")
 	brokerUID := flag.Uint64("broker-uid", 0, "expected unprivileged broker UID")
 	rootID := flag.String("root-id", "lifecycle", "broker filesystem root ID")
 	relativePath := flag.String("relative-path", "probe.txt", "root-relative probe path")
 	expectedContent := flag.String("expected-content", "", "exact expected read result")
 	markerPath := flag.String("marker", "", "hold-mode readiness marker")
+	requestPath := flag.String("request", "", "signed typed request JSON path")
 	timeout := flag.Duration("timeout", 5*time.Second, "complete probe timeout")
 	flag.Parse()
 
+	if *mode == "normalize-request" {
+		return normalizeRequest(*requestPath, os.Stdout)
+	}
 	if *socketPath == "" || *brokerUID == 0 || *brokerUID > uint64(^uint32(0)) || *timeout <= 0 {
 		return errors.New("socket, a uint32 nonzero broker UID, and a positive timeout are required")
 	}
@@ -43,11 +48,87 @@ func run() error {
 	switch *mode {
 	case "read":
 		return readProbe(*socketPath, uint32(*brokerUID), *rootID, *relativePath, *expectedContent, *timeout)
+	case "execute-and-expect-cancel":
+		return executeAndExpectCancel(*socketPath, uint32(*brokerUID), *requestPath, *timeout)
 	case "hold-incomplete-frame":
 		return holdIncompleteFrame(*socketPath, *markerPath, *timeout)
 	default:
 		return fmt.Errorf("unsupported mode %q", *mode)
 	}
+}
+
+func executeAndExpectCancel(socketPath string, brokerUID uint32, requestPath string, timeout time.Duration) error {
+	request, err := readRequest(requestPath)
+	if err != nil {
+		return err
+	}
+	client, err := actionbroker.NewClient(
+		socketPath,
+		brokerUID,
+		actionbroker.WithTransportTimeout(timeout),
+	)
+	if err != nil {
+		return fmt.Errorf("construct client: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	response, executeErr := client.Execute(ctx, request)
+	if executeErr == nil {
+		return fmt.Errorf(
+			"approved command unexpectedly completed instead of being cancelled: status=%s output=%#v",
+			response.Status,
+			response.Output.Result(),
+		)
+	}
+	var brokerError *actionbroker.BrokerError
+	if !errors.As(executeErr, &brokerError) || response == nil ||
+		brokerError.Status != actionbroker.StatusCancelled || brokerError.Code != "cancelled" {
+		return fmt.Errorf("approved command did not return broker-confirmed cancellation: %w", executeErr)
+	}
+	return nil
+}
+
+func normalizeRequest(requestPath string, destination io.Writer) error {
+	request, err := readRequest(requestPath)
+	if err != nil {
+		return err
+	}
+	encoder := json.NewEncoder(destination)
+	if err := encoder.Encode(request); err != nil {
+		return fmt.Errorf("encode normalized request: %w", err)
+	}
+	return nil
+}
+
+func readRequest(requestPath string) (actionbroker.ActionRequest, error) {
+	var request actionbroker.ActionRequest
+	if requestPath == "" {
+		return request, errors.New("request path is required")
+	}
+	requestFile, err := os.Open(requestPath)
+	if err != nil {
+		return request, fmt.Errorf("open signed request: %w", err)
+	}
+	defer requestFile.Close()
+	decoder := json.NewDecoder(io.LimitReader(requestFile, int64(actionbroker.MaxFrameSize)+1))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		return request, fmt.Errorf("decode signed request: %w", err)
+	}
+	if err := requireJSONEnd(decoder); err != nil {
+		return request, err
+	}
+	return request, nil
+}
+
+func requireJSONEnd(decoder *json.Decoder) error {
+	var extra any
+	if err := decoder.Decode(&extra); errors.Is(err, io.EOF) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("decode signed request trailing data: %w", err)
+	}
+	return errors.New("signed request contains multiple JSON values")
 }
 
 func readProbe(socketPath string, brokerUID uint32, rootID, relativePath, expectedContent string, timeout time.Duration) error {

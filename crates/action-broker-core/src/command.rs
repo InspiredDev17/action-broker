@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -348,6 +348,12 @@ fn supervise_child(
             "command output exceeded the configured limit",
         ));
     }
+    if sandbox_launcher_reported_failure(status, &stderr_bytes) {
+        return Err(BrokerError::new(
+            ErrorCode::SandboxFailure,
+            "OS sandbox launcher failed before approved execution",
+        ));
+    }
     Ok(ExecuteApprovedCommandOutput {
         exit_code: status.code(),
         stdout_base64: base64::engine::general_purpose::STANDARD.encode(stdout_bytes),
@@ -356,6 +362,13 @@ fn supervise_child(
         stderr_truncated: false,
         timed_out: false,
     })
+}
+
+fn sandbox_launcher_reported_failure(status: ExitStatus, stderr: &[u8]) -> bool {
+    !status.success()
+        && [b"bwrap:".as_slice(), b"prlimit:".as_slice()]
+            .iter()
+            .any(|prefix| stderr.starts_with(prefix))
 }
 
 fn bounded_reader<R: Read + Send + 'static>(
@@ -431,7 +444,7 @@ fn os_sandbox_command(plan: &SandboxLaunchPlan) -> BrokerResult<Command> {
         "--new-session",
         "--unshare-all",
         "--clearenv",
-        "--proc",
+        "--dir",
         "/proc",
         "--dev",
         "/dev",
@@ -816,6 +829,35 @@ mod tests {
     }
 
     #[test]
+    fn linux_sandbox_exposes_an_empty_proc_directory() -> BrokerResult<()> {
+        let plan = SandboxLaunchPlan {
+            version: 1,
+            backend: OsSandboxBackend::LinuxBubblewrap {
+                executable_path: "/usr/bin/bwrap".to_owned(),
+                executable_sha256: "00".repeat(32),
+                resource_limiter_path: "/usr/bin/prlimit".to_owned(),
+                resource_limiter_sha256: "00".repeat(32),
+            },
+            executable_path: "/usr/bin/sleep".to_owned(),
+            arguments: vec!["1".to_owned()],
+            environment: BTreeMap::new(),
+            working_directory: "/tmp".to_owned(),
+            working_directory_access: WorkingDirectoryAccess::ReadOnly,
+            limits: ResourceLimitConfig::default(),
+            timeout_milliseconds: 1_000,
+        };
+
+        let command = os_sandbox_command(&plan)?;
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(arguments.windows(2).any(|pair| pair == ["--dir", "/proc"]));
+        assert!(!arguments.iter().any(|argument| argument == "--proc"));
+        Ok(())
+    }
+
+    #[test]
     fn cancellation_token_is_monotonic() {
         let token = CancellationToken::new();
         assert!(!token.is_cancelled());
@@ -918,6 +960,51 @@ mod tests {
             })
         ));
         assert!(started.elapsed() < Duration::from_secs(2));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_launcher_diagnostic_fails_closed() -> Result<(), Box<dyn Error>> {
+        let Some(shell) = first_existing(&["/bin/sh", "/usr/bin/sh"]) else {
+            return Ok(());
+        };
+        let child = spawn_test_process(
+            shell,
+            &["-c", "printf 'bwrap: setup failed\\n' >&2; exit 1"],
+        )?;
+        let result = supervise_child(
+            child,
+            1_024,
+            Duration::from_secs(1),
+            &CancellationToken::new(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(BrokerError {
+                code: ErrorCode::SandboxFailure,
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn approved_program_nonzero_exit_remains_structured_output() -> Result<(), Box<dyn Error>> {
+        let Some(shell) = first_existing(&["/bin/sh", "/usr/bin/sh"]) else {
+            return Ok(());
+        };
+        let child = spawn_test_process(shell, &["-c", "printf 'ordinary failure\\n' >&2; exit 1"])?;
+        let output = supervise_child(
+            child,
+            1_024,
+            Duration::from_secs(1),
+            &CancellationToken::new(),
+        )?;
+
+        assert_eq!(output.exit_code, Some(1));
         Ok(())
     }
 

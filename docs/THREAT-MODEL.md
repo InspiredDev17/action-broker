@@ -57,8 +57,12 @@ The Linux service-lifecycle harness provides narrow evidence for distinct local
 identities, peer rejection, typed read execution, first-signal draining, socket
 cleanup, audit validation, and restart. Its root phase only creates disposable
 numeric identities and root-owned fixture policy; requests still traverse the
-normal daemon boundary. It does not qualify approved-command isolation, cgroup
-containment, production filesystem mounts, or external side-effect recovery.
+normal daemon boundary. A test-only Rust issuer exercises real Ed25519/JCS
+approval verification and replay consumption for an approved `sleep`, then the
+harness proves first-signal cancellation and descendant termination. The
+embedded fixture key is not production authority. This still does not qualify
+general approved-command isolation, cgroup containment, production filesystem
+mounts, or external side-effect recovery.
 
 ## Threats, controls, and residual risk
 

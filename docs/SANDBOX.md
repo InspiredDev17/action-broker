@@ -96,9 +96,18 @@ Before launch the Linux executor:
    descriptor-allowed request keys;
 5. rejects `LD_PRELOAD`, `LD_LIBRARY_PATH`, `DYLD_*`, arbitrary `PATH`, and
    equivalent loader/runtime injection controls;
-6. configures available resource limits and process-group handling;
-7. connects bounded stdout/stderr collectors; and
-8. starts deadline and cancellation supervision before accepting output.
+6. creates new Bubblewrap namespaces, exposes only read-only runtime trees, an
+   empty `/proc` directory, a minimal `/dev`, and the explicitly scoped working
+   directory;
+7. configures available resource limits and process-group handling;
+8. connects bounded stdout/stderr collectors; and
+9. starts deadline and cancellation supervision before accepting output.
+
+Known `prlimit` or Bubblewrap setup diagnostics are classified as a sandbox
+failure, not as a successful approved program with a nonzero exit. The broker
+returns a fixed secret-free error and emits the corresponding Agent Green
+event. Ordinary nonzero exits from an approved program remain structured
+command results.
 
 Secrets held by the broker must not be placed in child arguments, environment,
 stdin, or inherited descriptors. All nonessential file descriptors are closed

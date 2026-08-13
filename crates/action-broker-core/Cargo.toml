@@ -7,6 +7,15 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+lifecycle-test-fixture = []
+
+[[example]]
+name = "issue_lifecycle_approval"
+path = "examples/issue_lifecycle_approval.rs"
+required-features = ["lifecycle-test-fixture"]
+
 [dependencies]
 base64.workspace = true
 cap-std.workspace = true
