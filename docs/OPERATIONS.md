@@ -310,7 +310,13 @@ root-owned hard-revocation cutoff later than two test tokens' issuance times,
 and restarts. The primary-key token must fail generically with no process or
 audit start; the same request and nonce under the active replacement key must
 execute once, cancel cleanly, and reject replay after another restart. This
-proves the revoked-key denial did not consume the shared nonce.
+proves the revoked-key denial did not consume the shared nonce. Finally, it
+installs an exclusive issuance-retirement cutoff on that replacement key. A
+pre-cutoff token remains usable only within its signed TTL; a post-cutoff token
+is rejected without execution or audit start, while the identical request and
+nonce under the active successor key executes once and rejects replay after
+restart. This distinguishes bounded retirement overlap from immediate hard
+revocation.
 The embedded fixture signing keys must never appear in production trust
 configuration; the issuer binary is excluded from normal builds unless the
 `lifecycle-test-fixture` feature is explicitly enabled. A pass qualifies this

@@ -187,6 +187,14 @@ target, and nonce under the active replacement key remains usable exactly once.
 This is test evidence for restart-based revocation and global nonce ordering,
 not authority to restore a revoked key or reuse these embedded keys.
 
+The same operated lifecycle separately installs an exclusive retirement cutoff
+for the active replacement key. It proves a token issued before that cutoff
+still verifies only within its existing short TTL, while a token issued at the
+cutoff is denied without an audit start. The identical post-cutoff request and
+nonce under an active successor key executes once and then becomes replay. This
+qualifies rotation overlap without treating retirement as hard revocation or
+extending any signed lifetime.
+
 Key IDs are unique within a configuration; duplicate IDs, negative activation,
 and retirement/revocation instants at or before activation fail startup. Rotation
 lists old and new public keys simultaneously with non-overlapping issuance

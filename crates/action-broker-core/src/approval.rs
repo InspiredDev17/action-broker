@@ -1151,6 +1151,7 @@ mod tests {
     fn retirement_blocks_new_issuance_but_honors_prior_short_lived_token()
     -> Result<(), Box<dyn Error>> {
         let request = request();
+        let shared_store = Arc::new(InMemoryReplayStore::default());
         let lifecycle = TrustedKeyLifecycle {
             active_from_unix_seconds: NOW - 10_000,
             retire_at_unix_seconds: Some(NOW),
@@ -1159,8 +1160,7 @@ mod tests {
         let mut prior = claims(&request, "nonce-retired-prior")?;
         prior.issued_at_unix_seconds = NOW - 1;
         let prior_token = sign(&prior)?;
-        let verifier =
-            verifier_with_lifecycle(Arc::new(InMemoryReplayStore::default()), lifecycle)?;
+        let verifier = verifier_with_lifecycle(shared_store.clone(), lifecycle)?;
         assert!(
             verifier
                 .verify_at(&prior_token, &request, &[ApprovalType::ExplicitUser], NOW)
@@ -1170,12 +1170,24 @@ mod tests {
         let mut retired = claims(&request, "nonce-retired-new01")?;
         retired.issued_at_unix_seconds = NOW;
         let retired_token = sign(&retired)?;
-        let verifier =
-            verifier_with_lifecycle(Arc::new(InMemoryReplayStore::default()), lifecycle)?;
+        let verifier = verifier_with_lifecycle(shared_store.clone(), lifecycle)?;
         assert!(matches!(
             verifier.verify_at(&retired_token, &request, &[ApprovalType::ExplicitUser], NOW),
             Err(ApprovalError::KeyRetired)
         ));
+        let unretired = verifier_with_lifecycle(
+            shared_store,
+            TrustedKeyLifecycle {
+                active_from_unix_seconds: NOW - 10_000,
+                retire_at_unix_seconds: None,
+                revoke_at_unix_seconds: None,
+            },
+        )?;
+        assert!(
+            unretired
+                .verify_at(&retired_token, &request, &[ApprovalType::ExplicitUser], NOW)
+                .is_ok()
+        );
         Ok(())
     }
 

@@ -73,9 +73,13 @@ evidence. Finally, it stops the daemon, installs a root-owned revocation cutoff
 later than two tokens' issuance times, and restarts. The revoked primary-key
 token fails without an audit start; the identical request and nonce signed by
 the active replacement key executes once and becomes durable replay state. The
-embedded fixture keys are not production authority. This still does not qualify
-general approved-command isolation, cgroup containment, production filesystem
-mounts, or external side-effect recovery.
+same run then installs a replacement-key retirement cutoff, proves a pre-cutoff
+token remains usable only within its ordinary TTL, rejects a post-cutoff token
+without an audit start, and permits the identical request and nonce once under
+an active successor key before durable replay rejection. The embedded fixture
+keys are not production authority. This still does not qualify general
+approved-command isolation, cgroup containment, production filesystem mounts,
+or external side-effect recovery.
 
 ## Threats, controls, and residual risk
 

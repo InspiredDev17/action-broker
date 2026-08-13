@@ -29,8 +29,10 @@ use uuid::Uuid;
 
 const PRIMARY_KEY_ID: &str = "lifecycle-test-key";
 const REPLACEMENT_KEY_ID: &str = "lifecycle-replacement-key";
+const SUCCESSOR_KEY_ID: &str = "lifecycle-successor-key";
 const PRIMARY_SIGNING_SEED: [u8; 32] = [7_u8; 32];
 const REPLACEMENT_SIGNING_SEED: [u8; 32] = [11_u8; 32];
+const SUCCESSOR_SIGNING_SEED: [u8; 32] = [13_u8; 32];
 const APPROVAL_LIFETIME_SECONDS: i64 = 60;
 const EXPIRED_APPROVAL_AGE_SECONDS: i64 = 120;
 const FUTURE_APPROVAL_OFFSET_SECONDS: i64 = 120;
@@ -39,6 +41,7 @@ const FUTURE_APPROVAL_OFFSET_SECONDS: i64 = 120;
 enum RequestProfile {
     CurrentElevated,
     ReplacementElevated,
+    SuccessorElevated,
     CurrentExplicit,
     ExpiredElevated,
     FutureElevated,
@@ -70,9 +73,19 @@ fn run() -> Result<(), Box<dyn Error>> {
                 hex::encode(replacement_signing_key().verifying_key().as_bytes())
             );
         }
+        "successor-public-key" => {
+            reject_extra(&mut arguments)?;
+            println!(
+                "{}",
+                hex::encode(successor_signing_key().verifying_key().as_bytes())
+            );
+        }
         "request" => issue_request(&mut arguments, RequestProfile::CurrentElevated)?,
         "replacement-request" => {
             issue_request(&mut arguments, RequestProfile::ReplacementElevated)?;
+        }
+        "successor-request" => {
+            issue_request(&mut arguments, RequestProfile::SuccessorElevated)?;
         }
         "insufficient-approval-request" => {
             issue_request(&mut arguments, RequestProfile::CurrentExplicit)?;
@@ -83,7 +96,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "verify" => verify_request_file(&mut arguments)?,
         _ => {
             return Err(invalid(
-                "mode must be public-key, replacement-public-key, request, replacement-request, insufficient-approval-request, expired-request, future-request, issued-at, or verify",
+                "mode must be public-key, replacement-public-key, successor-public-key, request, replacement-request, successor-request, insufficient-approval-request, expired-request, future-request, issued-at, or verify",
             )
             .into());
         }
@@ -156,6 +169,7 @@ fn issue_request(
     let issued_at = match profile {
         RequestProfile::CurrentElevated
         | RequestProfile::ReplacementElevated
+        | RequestProfile::SuccessorElevated
         | RequestProfile::CurrentExplicit => now,
         RequestProfile::ExpiredElevated => now.saturating_sub(EXPIRED_APPROVAL_AGE_SECONDS),
         RequestProfile::FutureElevated => now.saturating_add(FUTURE_APPROVAL_OFFSET_SECONDS),
@@ -164,11 +178,13 @@ fn issue_request(
         RequestProfile::CurrentExplicit => ApprovalType::ExplicitUser,
         RequestProfile::CurrentElevated
         | RequestProfile::ReplacementElevated
+        | RequestProfile::SuccessorElevated
         | RequestProfile::ExpiredElevated
         | RequestProfile::FutureElevated => ApprovalType::ElevatedUser,
     };
     let (key_id, signing_key) = match profile {
         RequestProfile::ReplacementElevated => (REPLACEMENT_KEY_ID, replacement_signing_key()),
+        RequestProfile::SuccessorElevated => (SUCCESSOR_KEY_ID, successor_signing_key()),
         RequestProfile::CurrentElevated
         | RequestProfile::CurrentExplicit
         | RequestProfile::ExpiredElevated
@@ -200,7 +216,9 @@ fn issue_request(
         .to_compact()?,
     );
     match profile {
-        RequestProfile::CurrentElevated | RequestProfile::ReplacementElevated => {
+        RequestProfile::CurrentElevated
+        | RequestProfile::ReplacementElevated
+        | RequestProfile::SuccessorElevated => {
             verify_fixture_request(&request)?;
         }
         RequestProfile::CurrentExplicit => {
@@ -279,6 +297,15 @@ fn fixture_verifier() -> Result<ApprovalVerifier, ApprovalError> {
             revoke_at_unix_seconds: None,
         },
     )?;
+    keys.insert(
+        SUCCESSOR_KEY_ID,
+        successor_signing_key().verifying_key(),
+        TrustedKeyLifecycle {
+            active_from_unix_seconds: 0,
+            retire_at_unix_seconds: None,
+            revoke_at_unix_seconds: None,
+        },
+    )?;
     ApprovalVerifier::new(
         keys,
         Arc::new(InMemoryReplayStore::default()),
@@ -292,6 +319,10 @@ fn primary_signing_key() -> SigningKey {
 
 fn replacement_signing_key() -> SigningKey {
     SigningKey::from_bytes(&REPLACEMENT_SIGNING_SEED)
+}
+
+fn successor_signing_key() -> SigningKey {
+    SigningKey::from_bytes(&SUCCESSOR_SIGNING_SEED)
 }
 
 fn required(

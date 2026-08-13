@@ -183,7 +183,8 @@ not-yet-valid/expired approval, insufficient approval strength, and
 signed-arguments-tamper rejection without nonce consumption, approved-command
 cancellation with no surviving child, socket cleanup, post-restart rejection of
 the consumed approval, hard revocation followed by same-nonce replacement-key
-execution, mandatory approval-policy/tamper/revocation/replay evidence,
+execution, pre-cutoff retirement overlap followed by same-nonce successor-key
+execution, mandatory approval-policy/tamper/key-lifecycle/replay evidence,
 audit-chain verification, and clean restarts against the same durable state.
 The issuer is excluded from normal builds behind the explicit
 `lifecycle-test-fixture` feature and embeds test keys that must never be trusted

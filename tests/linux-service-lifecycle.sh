@@ -135,6 +135,7 @@ readonly socket_path="$socket_dir/action-broker.sock"
 readonly config_path="$config_dir/action-broker.json"
 readonly key_path="$config_dir/approval-public-key.hex"
 readonly replacement_key_path="$config_dir/replacement-approval-public-key.hex"
+readonly successor_key_path="$config_dir/successor-approval-public-key.hex"
 readonly audit_path="$state_dir/audit.jsonl"
 readonly event_path="$state_dir/agent-green.jsonl"
 readonly daemon_log="$test_root/daemon.log"
@@ -146,18 +147,26 @@ readonly insufficient_approval_request="$control_dir/insufficient-approval-reque
 readonly tampered_command_request="$control_dir/tampered-command-request.json"
 readonly revoked_command_request="$control_dir/revoked-command-request.json"
 readonly replacement_command_request="$control_dir/replacement-command-request.json"
+readonly prior_retirement_request="$control_dir/prior-retirement-request.json"
+readonly retired_command_request="$control_dir/retired-command-request.json"
+readonly successor_command_request="$control_dir/successor-command-request.json"
 readonly normalized_command_request="$test_root/normalized-command-request.json"
 readonly command_request_id='018f47d2-60d2-7af0-bc35-2a1f7f5a6d02'
 readonly replacement_request_id='018f47d2-60d2-7af0-bc35-2a1f7f5a6d03'
+readonly prior_retirement_request_id='018f47d2-60d2-7af0-bc35-2a1f7f5a6d04'
+readonly retirement_request_id='018f47d2-60d2-7af0-bc35-2a1f7f5a6d05'
 
 # These public keys belong only to the example fixture issuer. Production must
 # never trust them; the corresponding test seeds are absent from daemon config.
 "$bin_dir/issue-lifecycle-approval" public-key >"$key_path"
 "$bin_dir/issue-lifecycle-approval" replacement-public-key >"$replacement_key_path"
+"$bin_dir/issue-lifecycle-approval" successor-public-key >"$successor_key_path"
 chmod 0644 "$key_path"
 chmod 0644 "$replacement_key_path"
+chmod 0644 "$successor_key_path"
 chown 0:0 "$key_path"
 chown 0:0 "$replacement_key_path"
+chown 0:0 "$successor_key_path"
 
 bwrap_path=$(realpath "$(command -v bwrap)")
 prlimit_path=$(realpath "$(command -v prlimit)")
@@ -177,6 +186,7 @@ jq -n \
   --arg events "$event_path" \
   --arg key "$key_path" \
   --arg replacement_key "$replacement_key_path" \
+  --arg successor_key "$successor_key_path" \
   --arg action_root "$action_root" \
   --arg bwrap "$bwrap_path" \
   --arg bwrap_hash "$bwrap_hash" \
@@ -210,6 +220,13 @@ jq -n \
       {
         key_id: "lifecycle-replacement-key",
         public_key_path: $replacement_key,
+        active_from_unix_seconds: 0,
+        retire_at_unix_seconds: null,
+        revoke_at_unix_seconds: null
+      },
+      {
+        key_id: "lifecycle-successor-key",
+        public_key_path: $successor_key,
         active_from_unix_seconds: 0,
         retire_at_unix_seconds: null,
         revoke_at_unix_seconds: null
@@ -314,6 +331,14 @@ wait_for_sleep_process() {
     sleep "$SOCKET_WAIT_INTERVAL"
   done
   fail 'sandboxed approved command did not become observable'
+}
+
+wait_for_probe() {
+  local pid=$1
+  local label=$2
+  local status=0
+  wait "$pid" || status=$?
+  ((status == 0)) || fail "$label exited with status $status"
 }
 
 start_daemon() {
@@ -474,7 +499,7 @@ command_client_pid=$!
 wait_for_command_start
 wait_for_sleep_process
 stop_daemon_cleanly
-wait "$command_client_pid"
+wait_for_probe "$command_client_pid" 'initial command client'
 command_client_pid=''
 if pgrep -u "$broker_uid" -x sleep >/dev/null 2>&1; then
   fail 'sandboxed approved command survived broker shutdown'
@@ -523,7 +548,9 @@ chmod 0600 "$revoked_command_request" "$replacement_command_request"
 primary_issued_at=$("$bin_dir/issue-lifecycle-approval" issued-at "$revoked_command_request")
 replacement_issued_at=$("$bin_dir/issue-lifecycle-approval" issued-at "$replacement_command_request")
 last_issued_at=$primary_issued_at
-((replacement_issued_at > last_issued_at)) && last_issued_at=$replacement_issued_at
+if ((replacement_issued_at > last_issued_at)); then
+  last_issued_at=$replacement_issued_at
+fi
 while (( $(date +%s) <= last_issued_at )); do
   sleep "$SOCKET_WAIT_INTERVAL"
 done
@@ -564,7 +591,7 @@ command_client_pid=$!
 wait_for_command_start "$replacement_request_id"
 wait_for_sleep_process
 stop_daemon_cleanly
-wait "$command_client_pid"
+wait_for_probe "$command_client_pid" 'replacement-key command client'
 command_client_pid=''
 if pgrep -u "$broker_uid" -x sleep >/dev/null 2>&1; then
   fail 'replacement-key command survived broker shutdown'
@@ -597,6 +624,130 @@ jq -e -s --arg request_id "$replacement_request_id" '
 audit_summary=$("$bin_dir/action-brokerd" verify-audit --path "$audit_path")
 jq -e '.record_count == 6 and (.head_sha256 | length == 64)' <<<"$audit_summary" >/dev/null
 
+# Stop execution while installing an exclusive issuance-retirement cutoff for
+# the replacement key. A token issued before the cutoff remains valid for only
+# its ordinary short lifetime; a token issued at or after the cutoff must fail
+# without consuming the nonce shared with the active successor key.
+stop_daemon_cleanly
+setpriv --reuid "$platform_uid" --regid "$ipc_gid" --clear-groups \
+  env -i "$bin_dir/issue-lifecycle-approval" replacement-request \
+  "$prior_retirement_request_id" lifecycle-sleep lifecycle . 30000 lifecycle-retirement-prior-0001 \
+  >"$prior_retirement_request"
+chown "$platform_uid:$ipc_gid" "$prior_retirement_request"
+chmod 0600 "$prior_retirement_request"
+prior_retirement_issued_at=$("$bin_dir/issue-lifecycle-approval" issued-at "$prior_retirement_request")
+while (( $(date +%s) <= prior_retirement_issued_at )); do
+  sleep "$SOCKET_WAIT_INTERVAL"
+done
+retirement_cutoff=$(date +%s)
+readonly retirement_cutoff
+((prior_retirement_issued_at < retirement_cutoff)) || fail 'prior approval was not issued before retirement'
+retired_config="$config_dir/action-broker-retired.json"
+jq --argjson cutoff "$retirement_cutoff" '
+  (.approval_keys[] | select(.key_id == "lifecycle-replacement-key") | .retire_at_unix_seconds) = $cutoff
+' "$config_path" >"$retired_config"
+chmod 0644 "$retired_config"
+chown 0:0 "$retired_config"
+mv "$retired_config" "$config_path"
+
+setpriv --reuid "$platform_uid" --regid "$ipc_gid" --clear-groups \
+  env -i "$bin_dir/issue-lifecycle-approval" replacement-request \
+  "$retirement_request_id" lifecycle-sleep lifecycle . 30000 lifecycle-retirement-shared-0001 \
+  >"$retired_command_request"
+setpriv --reuid "$platform_uid" --regid "$ipc_gid" --clear-groups \
+  env -i "$bin_dir/issue-lifecycle-approval" successor-request \
+  "$retirement_request_id" lifecycle-sleep lifecycle . 30000 lifecycle-retirement-shared-0001 \
+  >"$successor_command_request"
+chown "$platform_uid:$ipc_gid" "$retired_command_request" "$successor_command_request"
+chmod 0600 "$retired_command_request" "$successor_command_request"
+retired_issued_at=$("$bin_dir/issue-lifecycle-approval" issued-at "$retired_command_request")
+successor_issued_at=$("$bin_dir/issue-lifecycle-approval" issued-at "$successor_command_request")
+((retired_issued_at >= retirement_cutoff)) || fail 'retired approval was issued before the cutoff'
+((successor_issued_at >= retirement_cutoff)) || fail 'successor approval was issued before the cutoff'
+
+# The pre-retirement token remains valid after restart but cannot outlive its
+# signed TTL. Cancel it through the normal shutdown path and bind its key in the
+# durable audit chain.
+start_daemon
+setpriv --reuid "$platform_uid" --regid "$ipc_gid" --clear-groups \
+  env -i "$bin_dir/lifecycletestclient" \
+  --mode execute-and-expect-cancel --socket "$socket_path" --broker-uid "$broker_uid" \
+  --request "$prior_retirement_request" --timeout 10s &
+command_client_pid=$!
+wait_for_command_start "$prior_retirement_request_id"
+wait_for_sleep_process
+stop_daemon_cleanly
+wait_for_probe "$command_client_pid" 'pre-retirement command client'
+command_client_pid=''
+if pgrep -u "$broker_uid" -x sleep >/dev/null 2>&1; then
+  fail 'pre-retirement command survived broker shutdown'
+fi
+jq -e -s --arg request_id "$prior_retirement_request_id" '
+  any(.[]; .event.request_id == $request_id and .event.phase == "started" and
+    .event.approval.required == true and .event.approval.key_id == "lifecycle-replacement-key") and
+  any(.[]; .event.request_id == $request_id and .event.phase == "finished" and
+    .event.error_code == "cancelled")
+' "$audit_path" >/dev/null
+audit_summary=$("$bin_dir/action-brokerd" verify-audit --path "$audit_path")
+jq -e '.record_count == 8 and (.head_sha256 | length == 64)' <<<"$audit_summary" >/dev/null
+
+# A post-cutoff token under the retired key must fail generically and create no
+# process or audit start. The active successor then uses the same request and
+# nonce exactly once, proving retirement rejection did not burn it.
+start_daemon
+setpriv --reuid "$platform_uid" --regid "$ipc_gid" --clear-groups \
+  env -i "$bin_dir/lifecycletestclient" \
+  --mode execute-and-expect-approval-invalid --socket "$socket_path" --broker-uid "$broker_uid" \
+  --request "$retired_command_request" --timeout 5s
+if pgrep -u "$broker_uid" -x sleep >/dev/null 2>&1; then
+  fail 'retired approval started a sandboxed command'
+fi
+jq -e -s --arg request_id "$retirement_request_id" '
+  [.[] | select(.kind == "approval_tampering" and .request_id == $request_id and
+    .reason_code == "approval_invalid" and .user_id == "lifecycle-user" and
+    .agent_id == "lifecycle-agent" and .task_id == "lifecycle-command-cancellation" and
+    .capability == "ExecuteApprovedCommand" and (.target_digest | length == 64))] | length == 1
+' "$event_path" >/dev/null
+audit_summary=$("$bin_dir/action-brokerd" verify-audit --path "$audit_path")
+jq -e '.record_count == 8 and (.head_sha256 | length == 64)' <<<"$audit_summary" >/dev/null
+
+setpriv --reuid "$platform_uid" --regid "$ipc_gid" --clear-groups \
+  env -i "$bin_dir/lifecycletestclient" \
+  --mode execute-and-expect-cancel --socket "$socket_path" --broker-uid "$broker_uid" \
+  --request "$successor_command_request" --timeout 10s &
+command_client_pid=$!
+wait_for_command_start "$retirement_request_id"
+wait_for_sleep_process
+stop_daemon_cleanly
+wait_for_probe "$command_client_pid" 'successor-key command client'
+command_client_pid=''
+if pgrep -u "$broker_uid" -x sleep >/dev/null 2>&1; then
+  fail 'successor-key command survived broker shutdown'
+fi
+jq -e -s --arg request_id "$retirement_request_id" '
+  any(.[]; .event.request_id == $request_id and .event.phase == "started" and
+    .event.approval.required == true and .event.approval.key_id == "lifecycle-successor-key") and
+  any(.[]; .event.request_id == $request_id and .event.phase == "finished" and
+    .event.error_code == "cancelled")
+' "$audit_path" >/dev/null
+
+start_daemon
+setpriv --reuid "$platform_uid" --regid "$ipc_gid" --clear-groups \
+  env -i "$bin_dir/lifecycletestclient" \
+  --mode execute-and-expect-replay --socket "$socket_path" --broker-uid "$broker_uid" \
+  --request "$successor_command_request" --timeout 5s
+if pgrep -u "$broker_uid" -x sleep >/dev/null 2>&1; then
+  fail 'replayed successor approval started a sandboxed command'
+fi
+jq -e -s --arg request_id "$retirement_request_id" '
+  any(.[]; .kind == "replayed_approval" and .request_id == $request_id and
+    .reason_code == "approval_replayed" and .user_id == "lifecycle-user" and
+    .agent_id == "lifecycle-agent" and .task_id == "lifecycle-command-cancellation" and
+    .capability == "ExecuteApprovedCommand" and (.target_digest | length == 64))
+' "$event_path" >/dev/null
+audit_summary=$("$bin_dir/action-brokerd" verify-audit --path "$audit_path")
+jq -e '.record_count == 10 and (.head_sha256 | length == 64)' <<<"$audit_summary" >/dev/null
+
 # Hold one authenticated worker in the real framed-read path, then request a
 # first-signal shutdown. The configured read deadline is shorter than the drain
 # grace, so the connection is classified, recorded, and closed before exit.
@@ -607,13 +758,13 @@ setpriv --reuid "$platform_uid" --regid "$ipc_gid" --clear-groups \
 hold_pid=$!
 wait_for_file "$hold_marker"
 stop_daemon_cleanly
-wait "$hold_pid"
+wait_for_probe "$hold_pid" 'incomplete-frame client'
 hold_pid=''
 
 jq -e -s 'any(.[]; .kind == "permission_bypass_attempt" and .reason_code == "unauthorized_platform_peer")' "$event_path" >/dev/null
 jq -e -s 'any(.[]; .kind == "resource_abuse_pattern" and .reason_code == "request_frame_incomplete")' "$event_path" >/dev/null
 audit_summary=$("$bin_dir/action-brokerd" verify-audit --path "$audit_path")
-jq -e '.record_count == 6 and (.head_sha256 | length == 64)' <<<"$audit_summary" >/dev/null
+jq -e '.record_count == 10 and (.head_sha256 | length == 64)' <<<"$audit_summary" >/dev/null
 
 # Reopen the same replay ledger, audit chain, and Agent Green spool, then prove
 # that a second clean lifecycle can bind and remove the same socket pathname.
